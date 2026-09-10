@@ -3,8 +3,10 @@
  * validates the file at the boundary, persists every mutation atomically
  * (exclusively-created unique temp file + rename, mode 0600), and serializes
  * read-modify-write cycles through both an in-process mutex and a
- * cross-process lock file (`${path}.lock`) so concurrent mutations from
- * multiple stores or processes cannot interleave or lose updates.
+ * cross-process lock file (`${path}.lock`) whose content names a unique
+ * owner token. Release and the pre-write re-check are ownership-safe: a lock
+ * stolen by a peer after its holder aged out is never unlinked or overwritten
+ * by the original holder — the cycle restarts from the read instead.
  */
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -48,6 +50,24 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 /** Locks older than this are presumed abandoned by a crashed writer. */
 const LOCK_STALE_MS = 30_000;
 
+/** The lock this instance currently holds: its path plus the content token proving ownership. */
+interface LockOwnership {
+  readonly lockPath: string;
+  readonly token: string;
+}
+
+/**
+ * Internal signal that the cross-process lock was lost mid-cycle (a peer
+ * broke our aged-out lock). Never escapes the store: the write cycle
+ * restarts from the read, bounded by the acquire deadline.
+ */
+class LockOwnershipLostError extends Error {
+  constructor() {
+    super("Accounts lock ownership was lost mid-cycle; restarting the write");
+    this.name = "LockOwnershipLostError";
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -57,6 +77,7 @@ function sleep(ms: number): Promise<void> {
 export class AccountStore {
   private records: readonly AccountRecord[] = [];
   private writeTail: Promise<unknown> = Promise.resolve();
+  private lockHeld: LockOwnership | undefined;
   private readonly clock: () => number;
 
   constructor(private readonly options: AccountStoreOptions) {
@@ -131,17 +152,21 @@ export class AccountStore {
   private async update(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
-    await this.exclusive(() =>
-      this.withFileLock(async () => {
-        const records = await this.readFromDisk();
-        const next = transform(records);
-        await this.persist(next);
-        this.records = next;
-      }),
-    );
+    await this.exclusive(() => this.withFileLock(transform));
   }
 
-  private async withFileLock<T>(task: () => Promise<T>): Promise<T> {
+  /**
+   * Run one read-modify-write cycle under the cross-process lock. Lock
+   * ownership is content-based: the lock file names its holder's unique
+   * token, so a lock that aged out and was stolen by a peer is detectable.
+   * Ownership is re-checked as the first act of the write itself (see
+   * `persist`); if it was lost — a peer broke our aged lock, persisted, or
+   * still holds it — the cycle aborts and restarts from the read, so the
+   * peer's update can never be overwritten.
+   */
+  private async withFileLock(
+    transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
+  ): Promise<void> {
     const lockPath = `${this.options.path}.lock`;
     const directory = dirname(this.options.path);
     try {
@@ -151,31 +176,42 @@ export class AccountStore {
         cause: error,
       });
     }
-    await this.acquireFileLock(lockPath);
-    try {
-      return await task();
-    } finally {
+    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+    for (;;) {
+      if (Date.now() >= deadline) {
+        throw new AccountStoreError(`Timed out waiting for the accounts lock at ${lockPath}`);
+      }
+      const token = `${process.pid}-${randomUUID()}`;
+      await this.acquireFileLock(lockPath, token, deadline);
+      this.lockHeld = { lockPath, token };
       try {
-        await rm(lockPath, { force: true });
-      } catch {
-        // Release is best-effort: a failed unlink leaves a lock that the
-        // stale-lock break recovers after LOCK_STALE_MS.
+        const records = await this.readFromDisk();
+        const next = transform(records);
+        await this.persist(next);
+        this.records = next;
+        return;
+      } catch (error) {
+        if (error instanceof LockOwnershipLostError) continue;
+        throw error;
+      } finally {
+        this.lockHeld = undefined;
+        await this.releaseFileLock(lockPath, token);
       }
     }
   }
 
   /**
    * Acquire the lock by exclusively creating `${path}.lock` (flag "wx", so
-   * only one process ever holds it). Contention retries on a fixed
-   * event-driven backoff bounded by LOCK_ACQUIRE_TIMEOUT_MS; a lock older
-   * than LOCK_STALE_MS is treated as abandoned by a crashed writer, unlinked,
-   * and the create is retried.
+   * only one process ever holds it) with our ownership token as content.
+   * Contention retries on a fixed event-driven backoff bounded by the cycle
+   * deadline; a lock older than LOCK_STALE_MS is treated as abandoned by a
+   * crashed or stalled writer and is replaced by ours (rm + exclusive
+   * re-create: only the acquirer that wins the create owns the lock).
    */
-  private async acquireFileLock(lockPath: string): Promise<void> {
-    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  private async acquireFileLock(lockPath: string, token: string, deadline: number): Promise<void> {
     for (;;) {
       try {
-        await writeFile(lockPath, "", { flag: "wx", mode: 0o600 });
+        await writeFile(lockPath, token, { flag: "wx", mode: 0o600 });
         return;
       } catch (error) {
         if (!isFileExistsError(error)) {
@@ -193,8 +229,42 @@ export class AccountStore {
   }
 
   /**
-   * Unlink the lock if its mtime is older than LOCK_STALE_MS. Returns whether
-   * the caller should retry the exclusive create immediately.
+   * Whether the lock file's current content still names our token. An
+   * unreadable or vanished lock proves nothing, so it counts as lost.
+   */
+  private async ownsLock(lockPath: string, token: string): Promise<boolean> {
+    let contents: string;
+    try {
+      contents = await readFile(lockPath, "utf-8");
+    } catch {
+      // Unreadable or vanished: we cannot prove ownership, so the lock is
+      // treated as lost and never released (release only removes our own).
+      return false;
+    }
+    return contents === token;
+  }
+
+  /**
+   * Remove the lock only if its content still names our token
+   * (read-compare-unlink). A lock stolen by a peer after we aged out belongs
+   * to the peer; unlinking it would destroy THEIR mutual exclusion. Release
+   * is otherwise best-effort: a failed unlink leaves OUR lock behind, which
+   * the stale-lock break recovers after LOCK_STALE_MS.
+   */
+  private async releaseFileLock(lockPath: string, token: string): Promise<void> {
+    if (!(await this.ownsLock(lockPath, token))) return;
+    try {
+      await rm(lockPath, { force: true });
+    } catch {
+      // Best-effort: the leftover lock is ours and ages out of the way.
+    }
+  }
+
+  /**
+   * Replace the lock if its mtime is older than LOCK_STALE_MS: unlink it and
+   * let the caller's exclusive re-create install our own token as the
+   * content (only the acquirer that wins the create owns the lock). Returns
+   * whether the caller should retry the exclusive create immediately.
    */
   private async breakStaleLock(lockPath: string): Promise<boolean> {
     let modifiedMs: number;
@@ -247,6 +317,15 @@ export class AccountStore {
   }
 
   private async persist(records: readonly AccountRecord[]): Promise<void> {
+    // Ownership re-check: the FIRST act of the write. Anything that suspended
+    // this writer between its locked read and here — a stall long enough for
+    // a peer to break its aged lock, persist and release — is detected now,
+    // before the file is touched. Losing ownership aborts the cycle (the
+    // caller restarts from the read) instead of clobbering the peer's update.
+    const held = this.lockHeld;
+    if (held !== undefined && !(await this.ownsLock(held.lockPath, held.token))) {
+      throw new LockOwnershipLostError();
+    }
     // Unique temp name plus exclusive create: flag "wx" fails when the path
     // already exists, so a stale temp file left behind by a crashed run —
     // possibly carrying a weaker mode such as 0644 — can never be reused.
@@ -254,10 +333,14 @@ export class AccountStore {
     // preserves it onto the credential file. No chmod is needed on any
     // platform we target because "wx" + mode is honored at create time; a
     // defensive chmod would only paper over a reused-temp regression.
+    // Boundary check first: a refused serialization must surface its typed
+    // field-naming error unwrapped, and must happen before any IO so the
+    // previous valid file (or absence of one) is never touched.
+    const contents = serializeAccountFile(records);
     const temporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await mkdir(dirname(this.options.path), { recursive: true });
-      await writeFile(temporaryPath, serializeAccountFile(records), {
+      await writeFile(temporaryPath, contents, {
         encoding: "utf-8",
         flag: "wx",
         mode: 0o600,
