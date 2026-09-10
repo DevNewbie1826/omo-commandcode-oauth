@@ -19,7 +19,6 @@ export type FetchBillingSnapshotOptions = {
   readonly apiKey: string;
   readonly fetchImpl?: typeof fetch;
   readonly apiBase?: string;
-  readonly now?: () => number;
 };
 
 export type BillingCache = {
