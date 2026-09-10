@@ -1,6 +1,8 @@
 const RATE_LIMIT_WINDOWS = ["fiveHour", "daily", "weekly"] as const;
 const USAGE_LIMIT = /usage limit for your plan/i;
 const RESETS_AT = /resets at (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/i;
+/** Max valid Date epoch ms (100,000,000 days from epoch). Larger or non-finite values are invalid. */
+const MAX_DATE_MS = 8.64e15;
 
 export type RateLimitWindow = (typeof RATE_LIMIT_WINDOWS)[number];
 export type CooldownReason = "rate-limit" | "credits-exhausted";
@@ -52,10 +54,15 @@ function parseWindow(value: unknown): RateLimitWindow | undefined {
   return undefined;
 }
 
+function toRetryAtMs(value: number): number | undefined {
+  if (!Number.isFinite(value) || Math.abs(value) > MAX_DATE_MS) return undefined;
+  return value;
+}
+
 function unixSecondsToMs(value: unknown): number | undefined {
   const seconds = finiteNumber(value);
   if (seconds === undefined) return undefined;
-  return seconds * 1000;
+  return toRetryAtMs(seconds * 1000);
 }
 
 function isCreditCode(code: string | undefined): boolean {
@@ -67,9 +74,7 @@ function messageIsoMs(message: string | undefined): number | undefined {
   const match = RESETS_AT.exec(message);
   const iso = match?.[1];
   if (iso === undefined) return undefined;
-  const parsed = Date.parse(iso);
-  if (Number.isNaN(parsed)) return undefined;
-  return parsed;
+  return toRetryAtMs(Date.parse(iso));
 }
 
 function headerValue(
@@ -92,10 +97,8 @@ function headerValue(
 
 function parseRetryAfter(value: string, now: number): number | undefined {
   const trimmed = value.trim();
-  if (/^\d+$/.test(trimmed)) return now + Number(trimmed) * 1000;
-  const parsed = Date.parse(trimmed);
-  if (Number.isNaN(parsed)) return undefined;
-  return parsed;
+  if (/^\d+$/.test(trimmed)) return toRetryAtMs(now + Number(trimmed) * 1000);
+  return toRetryAtMs(Date.parse(trimmed));
 }
 
 function resetMsFrom(

@@ -8,6 +8,10 @@ const MESSAGE_ISO_MS = Date.parse(MESSAGE_ISO);
 const HTTP_DATE = "Wed, 16 Sep 2026 05:00:00 GMT";
 const HTTP_DATE_MS = Date.parse(HTTP_DATE);
 const NOW_MS = 1_700_000_000_000;
+const MAX_DATE_MS = 8.64e15;
+const MAX_DATE_SECONDS = MAX_DATE_MS / 1000;
+const FAR_FUTURE_HTTP_DATE = "Sun, 14 Sep 275760 00:00:00 GMT";
+const OVERFLOW_RETRY_AFTER = "9".repeat(309);
 
 describe("parseCooldown", () => {
   it("Given a 429 RATE_LIMITED body with fiveHour reset, When parseCooldown runs, Then retryAtMs is reset seconds as ms with rate-limit window", () => {
@@ -209,5 +213,183 @@ describe("parseCooldown", () => {
       retryAtMs: HTTP_DATE_MS,
       reason: "rate-limit",
     });
+  });
+
+  it("Given rateLimit.reset of 1e308, When parseCooldown runs, Then the invalid reset falls through to Retry-After or null", () => {
+    const withRetryAfter = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { window: "fiveHour", reset: 1e308 },
+        },
+      },
+      headers: { "retry-after": "30" },
+      now: NOW_MS,
+    });
+    const withMessage = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          message: `usage limit for your plan ... resets at ${MESSAGE_ISO}`,
+          rateLimit: { reset: 1e308 },
+        },
+      },
+      headers: { "retry-after": "30" },
+      now: NOW_MS,
+    });
+    const withoutHints = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { window: "daily", reset: 1e308 },
+        },
+      },
+    });
+
+    expect(withRetryAfter).toEqual({
+      retryAtMs: NOW_MS + 30_000,
+      reason: "rate-limit",
+      window: "fiveHour",
+    });
+    expect(withMessage).toEqual({
+      retryAtMs: MESSAGE_ISO_MS,
+      reason: "rate-limit",
+    });
+    expect(withoutHints).toEqual({
+      retryAtMs: null,
+      reason: "rate-limit",
+      window: "daily",
+    });
+  });
+
+  it("Given rateLimit.reset exactly at the max valid Date epoch, When parseCooldown runs, Then retryAtMs is accepted", () => {
+    const decision = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { window: "weekly", reset: MAX_DATE_SECONDS },
+        },
+      },
+    });
+
+    expect(decision).toEqual({
+      retryAtMs: MAX_DATE_MS,
+      reason: "rate-limit",
+      window: "weekly",
+    });
+  });
+
+  it("Given a Retry-After HTTP-date beyond the max valid Date, When parseCooldown runs, Then retryAtMs is null", () => {
+    const decision = parseCooldown({
+      status: 429,
+      body: {},
+      headers: { "Retry-After": FAR_FUTURE_HTTP_DATE },
+    });
+
+    expect(decision).toEqual({
+      retryAtMs: null,
+      reason: "rate-limit",
+    });
+  });
+
+  it('Given rateLimit.reset as the string "1758000000", When parseCooldown runs, Then the string is ignored and the fallback chain is used', () => {
+    const withMessage = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          message: `usage limit for your plan ... resets at ${MESSAGE_ISO}`,
+          rateLimit: { reset: "1758000000" },
+        },
+      },
+      headers: { "retry-after": "30" },
+      now: NOW_MS,
+    });
+    const withRetryAfter = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { reset: "1758000000" },
+        },
+      },
+      headers: { "retry-after": "30" },
+      now: NOW_MS,
+    });
+    const withoutHints = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { reset: "1758000000" },
+        },
+      },
+    });
+
+    expect(withMessage).toEqual({
+      retryAtMs: MESSAGE_ISO_MS,
+      reason: "rate-limit",
+    });
+    expect(withRetryAfter).toEqual({
+      retryAtMs: NOW_MS + 30_000,
+      reason: "rate-limit",
+    });
+    expect(withoutHints).toEqual({
+      retryAtMs: null,
+      reason: "rate-limit",
+    });
+  });
+
+  it("Given overflow, NaN, or Infinity on any conversion path, When parseCooldown runs, Then retryAtMs is never NaN or Infinity", () => {
+    const decisions = [
+      parseCooldown({
+        status: 429,
+        body: { error: { code: "RATE_LIMITED", rateLimit: { reset: 1e308 } } },
+      }),
+      parseCooldown({
+        status: 429,
+        body: { error: { code: "RATE_LIMITED", rateLimit: { reset: -1e308 } } },
+      }),
+      parseCooldown({
+        status: 429,
+        body: { error: { code: "RATE_LIMITED", rateLimit: { reset: Number.POSITIVE_INFINITY } } },
+      }),
+      parseCooldown({
+        status: 429,
+        body: { error: { code: "RATE_LIMITED", rateLimit: { reset: Number.NaN } } },
+      }),
+      parseCooldown({
+        status: 429,
+        body: {},
+        headers: { "retry-after": OVERFLOW_RETRY_AFTER },
+        now: NOW_MS,
+      }),
+      parseCooldown({
+        status: 429,
+        body: {},
+        headers: { "Retry-After": FAR_FUTURE_HTTP_DATE },
+      }),
+      parseCooldown({
+        status: 402,
+        body: { error: { code: "insufficient_credits", rateLimit: { reset: 1e308 } } },
+      }),
+    ];
+
+    for (const decision of decisions) {
+      expect(decision).not.toBeNull();
+      if (decision === null) continue;
+      const retryAtMs = decision.retryAtMs;
+      expect(retryAtMs === null || Number.isFinite(retryAtMs)).toBe(true);
+      expect(retryAtMs).not.toBe(Number.POSITIVE_INFINITY);
+      expect(retryAtMs).not.toBe(Number.NEGATIVE_INFINITY);
+      if (retryAtMs !== null) {
+        expect(Number.isNaN(retryAtMs)).toBe(false);
+        expect(Math.abs(retryAtMs)).toBeLessThanOrEqual(MAX_DATE_MS);
+      }
+    }
   });
 });
