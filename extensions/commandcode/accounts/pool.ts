@@ -5,9 +5,10 @@
  * - Healthy means enabled, cooldown expired (`retryAt` undefined or <= now),
  *   and not excluded.
  * - Tier 0: accounts with a credits snapshot where monthly+free > 0 and the
- *   period ends within `expiryWindowMs` (env `COMMANDCODE_EXPIRY_WINDOW_MS`,
- *   default 24h) — sorted by `periodEnd` ascending, so the account about to
- *   expire first gets drained first.
+ *   period ends strictly after now and within `expiryWindowMs` (env
+ *   `COMMANDCODE_EXPIRY_WINDOW_MS`, default 24h) — sorted by `periodEnd`
+ *   ascending, so the account about to expire first gets drained first.
+ *   Stale snapshots (`periodEnd` <= now) stay in tier 1.
  * - Tier 1: every other healthy account, in file order.
  * - Sticky: a bound sessionId keeps its account while it stays healthy;
  *   otherwise the first candidate in tier order is picked and bound.
@@ -97,7 +98,11 @@ function isExpiringTier(
 ): record is ExpiringAccount {
   const credits = record.credits;
   if (credits === undefined) return false;
-  return credits.monthly + credits.free > 0 && credits.periodEnd - nowMs < expiryWindowMs;
+  return (
+    credits.monthly + credits.free > 0 &&
+    credits.periodEnd > nowMs &&
+    credits.periodEnd - nowMs < expiryWindowMs
+  );
 }
 
 function byPeriodEndAsc(left: ExpiringAccount, right: ExpiringAccount): number {
