@@ -25,7 +25,7 @@ import {
   createFailoverStream,
   type StreamSimpleLike,
 } from "../extensions/commandcode/transport.js";
-import commandcodeExtension from "../extensions/commandcode/index.js";
+import commandcodeExtension, { createPinnedAccountResolver } from "../extensions/commandcode/index.js";
 
 const BASE_MS = 1_700_000_000_000;
 const RESET_SECONDS = 1_758_000_000;
@@ -460,6 +460,78 @@ describe("createFailoverStream (real adapter wire)", () => {
     expect(JSON.stringify(events)).toContain("hello");
     const records = await store.load();
     expect(records.find((record) => record.id === "a")?.retryAt).toBeDefined();
+  });
+});
+
+describe("pinned options.apiKey", () => {
+  it("Given the pinned account is cooling down, When the host pins its token, Then rotation falls through to the healthy other account", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    await pool.quarantine("account1", clock.now() + 60_000);
+    const seen: string[] = [];
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+        seen.push(options?.apiKey ?? "");
+        return emit([startEvent(), doneEvent()]);
+      },
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    const events = await collect(
+      streamSimple(MODEL, CONTEXT, { apiKey: "token-account1", sessionId: "session-pinned" }),
+    );
+
+    expect(seen).toEqual(["token-account2"]);
+    expect(events.map((event) => event.type)).toEqual(["start", "done"]);
+  });
+
+  it("Given the pinned account is disabled, When the host pins its token, Then rotation falls through to the healthy other account", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    await store.setEnabled("account1", false);
+    const seen: string[] = [];
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+        seen.push(options?.apiKey ?? "");
+        return emit([startEvent(), doneEvent()]);
+      },
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    const events = await collect(
+      streamSimple(MODEL, CONTEXT, { apiKey: "token-account1", sessionId: "session-pinned" }),
+    );
+
+    expect(seen).toEqual(["token-account2"]);
+    expect(events.map((event) => event.type)).toEqual(["start", "done"]);
+  });
+
+  it("Given the pinned account is healthy, When the host pins its token, Then the pinned account is used and sticky bindings survive the pinned request", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    const seen: string[] = [];
+    const adapter: StreamSimpleLike = (_model, _context, options) => {
+      seen.push(options?.apiKey ?? "");
+      return emit([startEvent(), doneEvent()]);
+    };
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: adapter,
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    // Seed a sticky session binding on account1.
+    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
+    // The healthy pinned account is attempted first...
+    await collect(
+      streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky", apiKey: "token-account2" }),
+    );
+    // ...and the next unpinned request still resolves through the untouched binding.
+    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
+
+    expect(seen).toEqual(["token-account1", "token-account2", "token-account1"]);
   });
 });
 

@@ -72,9 +72,10 @@ export interface FailoverStreamOptions {
   /** Fire-and-forget billing refresh hook; implementers must not reject. */
   readonly refreshBilling: (apiKey: string) => void;
   /**
-   * Maps an explicit `options.apiKey` to a pool account id. When provided and
-   * the key belongs to the pool, that account is attempted first (pinned);
-   * otherwise rotation starts from `pool.next`.
+   * Maps an explicit `options.apiKey` to a pool account id. Implementations
+   * must only return ids of accounts fit to attempt (enabled, cooldown lapsed,
+   * not already tried); when provided and the key resolves, that account is
+   * attempted first (pinned); otherwise rotation starts from `pool.next`.
    */
   readonly resolveAccountIdByToken?: (token: string) => Promise<string | undefined>;
 }

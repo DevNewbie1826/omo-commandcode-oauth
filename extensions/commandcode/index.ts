@@ -121,6 +121,28 @@ async function addPoolAccount(store: AccountStore, apiKey: string, whoami: Whoam
   });
 }
 
+/**
+ * Resolve a host-pinned `options.apiKey` to a pool account id — but only when
+ * that account is healthy per the store: enabled, cooldown (`retryAt`) lapsed,
+ * and not already tried. The failover transport resolves the pin once, before
+ * any attempt is made, so "not already tried" holds at resolution time; the
+ * transport then falls through to normal pool selection whenever this resolver
+ * declines an account.
+ */
+export function createPinnedAccountResolver(
+  store: AccountStore,
+  now: () => number = Date.now,
+): (token: string) => Promise<string | undefined> {
+  return async (token: string): Promise<string | undefined> => {
+    const records = await store.load();
+    const record = records.find((entry) => entry.token === token);
+    if (record === undefined || !record.enabled) return undefined;
+    const retryAt = record.retryAt;
+    if (retryAt !== undefined && retryAt > now()) return undefined;
+    return record.id;
+  };
+}
+
 function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string): ProviderModelConfig[] {
   return models.map((model) => ({
     id: model.id,
@@ -164,10 +186,7 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
           refreshBilling: (apiKey: string): void => {
             void refreshBillingSnapshot(apiKey);
           },
-          resolveAccountIdByToken: async (token: string): Promise<string | undefined> => {
-            const records = await store.load();
-            return records.find((record) => record.token === token)?.id;
-          },
+          resolveAccountIdByToken: createPinnedAccountResolver(store),
         });
 
   const catalog = await loadModels();
