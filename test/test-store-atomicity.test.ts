@@ -12,6 +12,7 @@ import {
   parseAccountFile,
   parseAccountOperationDisposition,
 } from "../extensions/commandcode/accounts/schema.js";
+import { AccountPool } from "../extensions/commandcode/accounts/pool.js";
 import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 import type { AccountRecordInput } from "../extensions/commandcode/accounts/schema.js";
 
@@ -540,6 +541,49 @@ describe("cross-process optimistic concurrency", () => {
 
     expect((await store.load()).map((record) => record.id)).toEqual(["a", "b"]);
   });
+
+  test(
+    "Given an add overlaps an order-only mutation, When the mutation reverses file order, Then pool selection and later writes preserve the reordered accounts",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "order-only-mutation.json");
+      const seed = new AccountStore({ path });
+      await seed.add(account("a"));
+      await seed.add(account("b"));
+
+      const pendingAdd = spawnStoreChild(path, "c", "pause-before-op");
+      await pendingAdd.waitForMessage("held-before-op");
+
+      let transformCalls = 0;
+      await new AccountStore({ path }).mutate((records) => {
+        transformCalls += 1;
+        return [...records].reverse();
+      });
+      expect(transformCalls).toBe(1);
+      await expect(persistedIds(path)).resolves.toEqual(["b", "a"]);
+      const reorderedSelection = await new AccountPool({
+        store: new AccountStore({ path }),
+      }).next();
+      expect(reorderedSelection.id).toBe("b");
+
+      const addPersisted = pendingAdd.waitForMessage("persisted");
+      pendingAdd.stdin.end("resume\n");
+      await expect(addPersisted).resolves.toMatchObject({ ids: ["b", "a", "c"] });
+      await expect(pendingAdd.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["b", "a", "c"]);
+
+      await new AccountStore({ path }).setEnabled("c", false);
+      const finalStore = new AccountStore({ path });
+      await expect(finalStore.load()).resolves.toMatchObject([
+        { id: "b", enabled: true },
+        { id: "a", enabled: true },
+        { id: "c", enabled: false },
+      ]);
+      const finalSelection = await new AccountPool({ store: finalStore }).next();
+      expect(finalSelection.id).toBe("b");
+    },
+    30_000,
+  );
 
   test("Given an arbitrary transform changes membership while toggling enabled, When it persists, Then it uses a compact and a true no-op writes no journal", async () => {
     const dir = await tempDir();

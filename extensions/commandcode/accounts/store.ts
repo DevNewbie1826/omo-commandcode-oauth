@@ -299,10 +299,8 @@ function sameRecord(left: AccountRecord, right: AccountRecord): boolean {
 
 function sameRecords(left: readonly AccountRecord[], right: readonly AccountRecord[]): boolean {
   if (left.length !== right.length) return false;
-  const leftById = [...left].sort((first, second) => first.id.localeCompare(second.id));
-  const rightById = [...right].sort((first, second) => first.id.localeCompare(second.id));
-  return leftById.every((record, index) => {
-    const candidate = rightById[index];
+  return left.every((record, index) => {
+    const candidate = right[index];
     return candidate !== undefined && sameRecord(record, candidate);
   });
 }
