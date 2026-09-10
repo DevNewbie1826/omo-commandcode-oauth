@@ -38,6 +38,15 @@ import type { CooldownDecision, ParseCooldownInput } from "./ratelimit.js";
 /** Quarantine fallback when a cooldown decision carries no reset time. */
 const DEFAULT_COOLDOWN_MS = 60_000;
 
+/**
+ * Canonical retry hint the pi-ai adapter appends to folded 429 failure
+ * messages — `… (retry-after-ms: <ms>)`, mirroring `appendRetryAfterMsMarker`
+ * in pi-ai's `utils/retry-hint`. The value is bounded like `parseCooldown`'s
+ * own timestamps: finite, positive, at most the max valid Date epoch ms.
+ */
+const RETRY_AFTER_MS_MARKER = /\(retry-after-ms: (\d+)\)$/;
+const MAX_RETRY_HINT_MS = 8.64e15;
+
 const ZERO_USAGE: Usage = {
   input: 0,
   output: 0,
@@ -142,6 +151,20 @@ function embeddedJsonBody(message: string): Record<string, unknown> | undefined 
   return isRecord(parsed) ? parsed : undefined;
 }
 
+/**
+ * Recover the adapter's retry hint from a folded failure message and express it
+ * as a Retry-After delta-seconds string. The adapter marker carries whole
+ * milliseconds; ceiling keeps the quarantine at or above what upstream asked
+ * for, and `parseCooldown`'s `toRetryAtMs` bound re-validates the result.
+ */
+function retryAfterHintSeconds(message: string): string | undefined {
+  const match = RETRY_AFTER_MS_MARKER.exec(message);
+  if (match === null) return undefined;
+  const ms = Number(match[1]);
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_RETRY_HINT_MS) return undefined;
+  return String(Math.ceil(ms / 1000));
+}
+
 function headersFrom(value: unknown): Record<string, string> | undefined {
   if (value instanceof Headers) {
     const headers: Record<string, string> = {};
@@ -164,10 +187,19 @@ function cooldownBodyOf(cause: FailureCause): unknown {
 }
 
 function cooldownInputOf(cause: FailureCause, nowMs: number): ParseCooldownInput {
+  const headers = headersFrom(cause.headers);
+  const retryAfterHint = retryAfterHintSeconds(cause.message);
   return {
     status: cause.status ?? statusFromMessage(cause.message) ?? 0,
     body: cooldownBodyOf(cause),
-    headers: headersFrom(cause.headers),
+    // The adapter's retry-after-ms marker is the wire's Retry-After equivalent;
+    // injected as a header hint it lands in parseCooldown's documented tier —
+    // after a body rateLimit.reset and a message "resets at" ISO, and ahead of
+    // any literal Retry-After header within that tier.
+    headers:
+      retryAfterHint === undefined
+        ? headers
+        : { ...headers, "retry-after": retryAfterHint },
     now: nowMs,
   };
 }

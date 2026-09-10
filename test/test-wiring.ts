@@ -520,6 +520,55 @@ describe("createFailoverStream (real adapter wire)", () => {
     expect(records.find((record) => record.id === "a")?.retryAt).toBeDefined();
   });
 
+  it("Given the provider answers token-a with 429 and only a Retry-After: 3600 header (no JSON body), When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined for the full hour instead of the 60s default", async () => {
+    const { store, pool, clock } = await setupPool(["a", "b"]);
+    const authorizations: string[] = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      const authorization =
+        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
+      if (authorization !== undefined) authorizations.push(authorization);
+      if (authorization !== "Bearer token-b") {
+        // Deliberately no JSON body: the retry hint must reach the transport
+        // solely through the adapter's canonical message marker.
+        response.writeHead(429, { "retry-after": "3600" });
+        response.end("slow down");
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(ANTHROPIC_SSE_SUCCESS);
+    });
+    staleServers.push(server);
+    const port = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          reject(new Error("Expected the retry-hint server to bind a TCP port"));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+
+    const wireModel: Model<"anthropic-messages"> = {
+      ...MODEL,
+      baseUrl: `http://127.0.0.1:${port}/provider`,
+    };
+    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
+
+    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
+
+    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
+    expect(events.at(-1)?.type).toBe("done");
+    const records = await store.load();
+    // The adapter folds "Retry-After: 3600" into its canonical
+    // "(retry-after-ms: 3600000)" message marker; the transport must persist
+    // the full hour rather than the 60s default quarantine.
+    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS + 3_600_000);
+    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
+  });
 });
 
 describe("pinned options.apiKey", () => {
