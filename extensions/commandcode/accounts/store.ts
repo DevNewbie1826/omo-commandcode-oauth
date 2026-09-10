@@ -76,6 +76,7 @@ type StoreOperation =
       readonly kind: "state";
       readonly baseLastAppliedSeq: number;
       readonly records: readonly AccountRecord[];
+      readonly purpose?: "compact";
     };
 
 type JournalEntry =
@@ -178,6 +179,10 @@ function parseOperation(value: unknown): StoreOperation {
       version: ACCOUNTS_FILE_VERSION,
       accounts: value["records"],
     }).accounts;
+    const purpose = value["purpose"];
+    if (purpose !== undefined && purpose !== "compact") {
+      throw new AccountStoreError('Expected journal field "purpose" to be "compact"');
+    }
     return {
       kind,
       baseLastAppliedSeq: parseNonNegativeSequence(
@@ -185,6 +190,7 @@ function parseOperation(value: unknown): StoreOperation {
         'journal field "baseLastAppliedSeq"',
       ),
       records,
+      ...(purpose === undefined ? {} : { purpose }),
     };
   }
   throw new AccountStoreError("Expected recognized journal operation kind");
@@ -595,7 +601,12 @@ export class AccountStore {
           type: "op",
           id: compactId,
           opId: compactId,
-          operation: { kind: "state", baseLastAppliedSeq: compactBase, records: replayed },
+          operation: {
+            kind: "state",
+            baseLastAppliedSeq: compactBase,
+            records: replayed,
+            purpose: "compact",
+          },
         });
         disk = await this.readDiskSnapshot();
         const withCompact = await this.readJournal();
@@ -679,6 +690,7 @@ export class AccountStore {
     const dispositions: Omit<AccountOperationDisposition, "version">[] = [];
     let current = records;
     let highestApplied = lastAppliedSeq;
+    let reachableAppliedIds = new Set(records.map((record) => record.id));
     for (const entry of entries) {
       if (
         entry.type !== "op" ||
@@ -692,8 +704,13 @@ export class AccountStore {
       const operation = entry.operation;
       let outcome: AccountOperationOutcome;
       if (operation.kind === "state") {
-        if (highestApplied <= operation.baseLastAppliedSeq) {
+        const compactDropsReachable = operation.purpose === "compact" &&
+          [...reachableAppliedIds].some(
+            (id) => !operation.records.some((record) => record.id === id),
+          );
+        if (highestApplied <= operation.baseLastAppliedSeq && !compactDropsReachable) {
           current = operation.records;
+          reachableAppliedIds = new Set(current.map((record) => record.id));
           outcome = "applied";
         } else {
           outcome = "skipped-stale";
@@ -706,11 +723,13 @@ export class AccountStore {
           outcome = "rejected-duplicate";
         } else {
           current = applyNarrowOperation(current, operation);
+          reachableAppliedIds.add(operation.record.id);
           outcome = "applied";
         }
       } else {
         const targetPresent = current.some((record) => record.id === operation.id);
         current = applyNarrowOperation(current, operation);
+        if (operation.kind === "remove") reachableAppliedIds.delete(operation.id);
         outcome = targetPresent || operation.kind === "remove" ? "applied" : "ignored-missing";
       }
       dispositions.push({ opId: entry.opId, outcome, seq: entry.seq });
@@ -742,6 +761,7 @@ export class AccountStore {
           kind: "state",
           baseLastAppliedSeq: maximumSeq,
           records: replayed,
+          purpose: "compact",
         },
       });
       const refreshedDisk = await this.readDiskSnapshot();
@@ -1117,8 +1137,15 @@ export class AccountStore {
       try {
         const contents = await this.readJournalContents();
         const disk = await this.readDiskSnapshotDirect();
-        const parsed = await this.parseJournalContentsWithoutWarnings(contents);
-        const seq = this.maximumSequence(parsed, disk.lastAppliedSeq) + 1;
+        const journal = await this.readJournal();
+        let maximum = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
+        for (const candidate of await this.versionCandidates()) {
+          maximum = Math.max(maximum, candidate.publicationSeq);
+          for (const disposition of await this.readVersionDispositions(candidate)) {
+            maximum = Math.max(maximum, disposition.seq);
+          }
+        }
+        const seq = maximum + 1;
         const framed = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
         const persisted = entry.type === "op" ? { ...entry, seq } : entry;
         const handle = await open(this.journalPath(), "a", 0o600);

@@ -806,6 +806,56 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test(
+    "Given a pending add is retained in an archive while a loader prepares a compact, When another add appends before that compact, Then archive-aware sequencing preserves both adds",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "archived-sequence-allocation.json");
+
+      const seed = spawnStoreChild(path, "seed", "pause-before-gc");
+      await seed.waitForMessage("held-before-gc");
+      seed.signal("SIGSTOP");
+      const archivedAdd = spawnStoreChild(path, "a", "pause-after-op");
+      await archivedAdd.waitForMessage("held-after-op");
+      archivedAdd.signal("SIGSTOP");
+
+      const seedPersisted = seed.waitForMessage("persisted");
+      seed.signal("SIGCONT");
+      seed.stdin.end("resume\n");
+      await expect(seedPersisted).resolves.toMatchObject({ type: "persisted" });
+      await expect(seed.onceExited).resolves.toBe(0);
+      await expect(stat(`${path}.journal`)).rejects.toMatchObject({ code: "ENOENT" });
+
+      const loader = spawnStoreChild(path, "loader", "pause-before-op", "load");
+      await loader.waitForMessage("held-before-op");
+      loader.signal("SIGSTOP");
+      const liveAdd = spawnStoreChild(path, "d", "pause-after-op");
+      await liveAdd.waitForMessage("held-after-op");
+      liveAdd.signal("SIGSTOP");
+
+      const loaded = loader.waitForMessage("persisted");
+      loader.signal("SIGCONT");
+      loader.stdin.end("resume\n");
+      await expect(loaded).resolves.toMatchObject({ type: "persisted" });
+      await expect(loader.onceExited).resolves.toBe(0);
+
+      const livePersisted = liveAdd.waitForMessage("persisted");
+      liveAdd.signal("SIGCONT");
+      liveAdd.stdin.end("resume\n");
+      await expect(livePersisted).resolves.toMatchObject({ type: "persisted" });
+      await expect(liveAdd.onceExited).resolves.toBe(0);
+
+      const archivedPersisted = archivedAdd.waitForMessage("persisted");
+      archivedAdd.signal("SIGCONT");
+      archivedAdd.stdin.end("resume\n");
+      await expect(archivedPersisted).resolves.toMatchObject({ type: "persisted" });
+      await expect(archivedAdd.onceExited).resolves.toBe(0);
+
+      expect([...(await persistedIds(path))].sort()).toEqual(["a", "d", "seed"]);
+    },
+    30_000,
+  );
+
   test.each([
     ["increment", 1, true],
     ["toggle", 0, false],
