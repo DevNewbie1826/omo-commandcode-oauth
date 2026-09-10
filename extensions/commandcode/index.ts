@@ -136,6 +136,10 @@ function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string):
 
 export default async function commandcodeExtension(pi: CommandCodeHost): Promise<void> {
   const apiBase = resolveApiBase();
+  // The pi-ai anthropic-messages adapter appends `/v1/messages` to the model
+  // baseUrl, so models must carry `{apiBase}/provider` for requests to land on
+  // the Command Code provider plane (`{apiBase}/provider/v1/messages`).
+  const upstreamBaseUrl = `${apiBase}/provider`;
   const store = new AccountStore({ path: resolveAccountsFilePath() });
   const pool = new AccountPool({ store });
   const billingCache = createBillingCache();
@@ -196,8 +200,8 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
     name: PROVIDER_NAME,
     api: "anthropic-messages",
     authHeader: true,
-    baseUrl: apiBase,
-    models: toProviderModels(catalog.models, apiBase),
+    baseUrl: upstreamBaseUrl,
+    models: toProviderModels(catalog.models, upstreamBaseUrl),
     ...(failover === undefined ? {} : { streamSimple: failover }),
     oauth: {
       name: PROVIDER_NAME,

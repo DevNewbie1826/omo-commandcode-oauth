@@ -269,7 +269,14 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
   ): Promise<AttemptOutcome> => {
     let inner: AssistantMessageEventStream;
     try {
-      const result = options.anthropicStreamSimple(model, context, { ...callOptions, apiKey: token });
+      const result = options.anthropicStreamSimple(model, context, {
+        ...callOptions,
+        apiKey: token,
+        // Hosts of authHeader providers inject a preset Authorization header
+        // into callOptions; every attempt must carry the SELECTED account's
+        // credential on the wire instead of the leaked host-pinned one.
+        headers: { ...callOptions?.headers, Authorization: `Bearer ${token}` },
+      });
       inner = result instanceof Promise ? await result : result;
     } catch (error) {
       return { kind: "failed-before-first-event", cause: failureFromThrown(error) };
