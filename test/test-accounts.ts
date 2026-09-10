@@ -390,7 +390,7 @@ describe("account pool selection", () => {
     lease.unbind();
   });
 
-  test("Given tier-0 accounts expiring at -1h/+1h/+2h and a plain account, When selecting and quarantining down the order, Then periodEnd sorts ascending and selection walks to tier 1", async () => {
+  test("Given accounts expiring at -1h/+1h/+2h and a plain account, When selecting and quarantining down the order, Then only upcoming expiries are tier 0, sorted by periodEnd, then file-order tier 1", async () => {
     const { pool, clock } = await setupPool([
       account({ id: "plain" }),
       account({ id: "late", credits: credits(BASE + 2 * HOUR) }),
@@ -398,13 +398,56 @@ describe("account pool selection", () => {
       account({ id: "expired", credits: credits(BASE - 1 * HOUR) }),
     ]);
 
-    expect((await pool.next(clock.now())).id).toBe("expired");
-    await pool.quarantine("expired", BASE + 60_000);
-    expect((await pool.next()).id).toBe("mid");
+    expect((await pool.next(clock.now())).id).toBe("mid");
     await pool.quarantine("mid", BASE + 60_000);
     expect((await pool.next()).id).toBe("late");
     await pool.quarantine("late", BASE + 60_000);
     expect((await pool.next()).id).toBe("plain");
+    await pool.quarantine("plain", BASE + 60_000);
+    expect((await pool.next()).id).toBe("expired");
+  });
+
+  test("Given a stale credits snapshot 30 days past periodEnd and an account expiring in one hour, When selecting, Then the stale snapshot stays tier 1", async () => {
+    const { pool } = await setupPool([
+      account({ id: "stale", credits: credits(BASE - 30 * DEFAULT_EXPIRY_WINDOW_MS) }),
+      account({ id: "soon", credits: credits(BASE + 1 * HOUR) }),
+    ]);
+
+    expect((await pool.next(BASE)).id).toBe("soon");
+    await pool.quarantine("soon", BASE + 60_000);
+    expect((await pool.next(BASE)).id).toBe("stale");
+  });
+
+  test("Given an account whose periodEnd is exactly now competing with an upcoming expiry, When selecting, Then only the strictly upcoming account is tier 0", async () => {
+    const { pool } = await setupPool([
+      account({ id: "exact", credits: credits(BASE) }),
+      account({ id: "soon", credits: credits(BASE + 1 * HOUR) }),
+    ]);
+
+    expect((await pool.next(BASE)).id).toBe("soon");
+    await pool.quarantine("soon", BASE + 60_000);
+    expect((await pool.next(BASE)).id).toBe("exact");
+  });
+
+  test("Given an account whose periodEnd is within the expiry window and a preceding plain account, When selecting, Then the upcoming account is tier 0", async () => {
+    const { pool } = await setupPool([
+      account({ id: "plain" }),
+      account({ id: "soon", credits: credits(BASE + 1 * HOUR) }),
+    ]);
+
+    expect((await pool.next(BASE)).id).toBe("soon");
+  });
+
+  test("Given free-only credits (monthly 0, free > 0) inside the window, When selecting, Then the account is tier 0 eligible", async () => {
+    const { pool } = await setupPool([
+      account({ id: "plain" }),
+      account({
+        id: "freeOnly",
+        credits: { monthly: 0, purchased: 0, free: 20, periodEnd: BASE + 1 * HOUR },
+      }),
+    ]);
+
+    expect((await pool.next(BASE)).id).toBe("freeOnly");
   });
 
   test("Given a session bound while its neighbour is excluded, When the exclusion is lifted, Then the binding stays sticky against tier order", async () => {
