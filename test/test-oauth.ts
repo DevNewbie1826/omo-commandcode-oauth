@@ -79,11 +79,16 @@ function onPromptReturning(key: string): Mock<(prompt: OAuthPrompt) => Promise<s
 
 /** onAuth double that resolves exactly when the host hands out the browser URL (no polling). */
 function onAuthSignal(): { onAuth: OAuthLoginCallbacks["onAuth"]; url: Promise<string> } {
-  let resolveUrl!: (url: string) => void;
+  let resolveUrl: ((url: string) => void) | undefined;
   const url = new Promise<string>((resolve) => {
     resolveUrl = resolve;
   });
-  const onAuth: OAuthLoginCallbacks["onAuth"] = vi.fn((info: OAuthAuthInfo) => resolveUrl(info.url));
+  const onAuth: OAuthLoginCallbacks["onAuth"] = vi.fn((info: OAuthAuthInfo) => {
+    if (resolveUrl === undefined) {
+      throw new Error("onAuth fired before the url promise executor ran");
+    }
+    resolveUrl(info.url);
+  });
   return { onAuth, url };
 }
 
