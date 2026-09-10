@@ -122,6 +122,7 @@ try {
     now: () => 1_700_000_000_000,
     journalLockStaleMs: modes.has("steal-lock-now") ? 0 : undefined,
   });
+  let transformCalls = 0;
   if (action === "load") await store.load();
   else if (action === "add") await store.add({
     id,
@@ -133,6 +134,18 @@ try {
     await store.mutate((records) =>
       records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
     );
+  } else if (["increment", "toggle", "saturate"].includes(action)) {
+    await store.mutate((records) => {
+      transformCalls += 1;
+      return records.map((record) => {
+        if (record.id !== id) return record;
+        if (action === "toggle") return { ...record, enabled: !record.enabled };
+        const monthly = action === "saturate"
+          ? Math.min(3, (record.credits?.monthly ?? 0) + 1)
+          : (record.credits?.monthly ?? 0) + 1;
+        return { ...record, credits: { ...record.credits, monthly } };
+      });
+    });
   } else {
     throw new Error(`unknown fixture action: ${action}`);
   }
@@ -142,6 +155,7 @@ try {
       pid: process.pid,
       id,
       ids: store.accounts().map((record) => record.id),
+      transformCalls,
     }),
   );
 } catch (error) {

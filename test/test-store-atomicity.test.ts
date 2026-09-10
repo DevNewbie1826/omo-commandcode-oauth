@@ -38,6 +38,7 @@ interface ChildMessage {
   readonly name?: string;
   readonly message?: string;
   readonly operation?: { readonly baseLastAppliedSeq?: number };
+  readonly transformCalls?: number;
 }
 
 function caughtOf(fn: () => unknown): unknown {
@@ -459,6 +460,38 @@ describe("cross-process optimistic concurrency", () => {
       loader.stdin.end("resume\n");
       await expect(loader.onceExited).resolves.toBe(0);
       expect([...(await persistedIds(path))].sort()).toEqual(["b", "p", "seed"]);
+    },
+    30_000,
+  );
+
+  test.each([
+    ["increment", 1, true],
+    ["toggle", 0, false],
+    ["saturate", 1, true],
+  ])(
+    "Given a non-idempotent %s transform pauses before append, When an unrelated peer add finishes and it resumes, Then it applies exactly once to fresh state and succeeds",
+    async (action, expectedMonthly, expectedEnabled) => {
+      const dir = await tempDir();
+      const path = join(dir, `arbitrary-${action}.json`);
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-before-op", action);
+      await mutation.waitForMessage("held-before-op");
+
+      const peer = spawnStoreChild(path, "b");
+      await expect(peer.onceExited).resolves.toBe(0);
+      mutation.stdin.end("resume\n");
+      const persisted = await mutation.waitForMessage("persisted");
+      await expect(mutation.onceExited).resolves.toBe(0);
+
+      const records = await new AccountStore({ path }).load();
+      expect(records.map((record) => record.id)).toEqual(["a", "b"]);
+      expect(records[0]?.credits?.monthly).toBe(expectedMonthly);
+      expect(records[0]?.enabled).toBe(expectedEnabled);
+      expect(persisted.transformCalls).toBe(2);
     },
     30_000,
   );

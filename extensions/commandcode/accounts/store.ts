@@ -173,10 +173,6 @@ function parseJournalEntry(value: unknown): JournalEntry {
   throw new AccountStoreError("Expected recognized journal line type");
 }
 
-function sameRecord(left: AccountRecord, right: AccountRecord): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
 function sameRecords(left: readonly AccountRecord[], right: readonly AccountRecord[]): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -280,17 +276,16 @@ export class AccountStore {
   async mutate(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
+    let intended: readonly AccountRecord[] = [];
     await this.update(
       (records, baseLastAppliedSeq) => {
-        const next = transform(records);
-        serializeAccountFile(next);
-        return this.narrowMutation(records, next, baseLastAppliedSeq);
-      },
-      (records) => {
-        const intended = transform(records);
+        intended = transform(records);
         serializeAccountFile(intended);
-        return sameRecords(records, intended);
+        return sameRecords(records, intended)
+          ? null
+          : { kind: "state", records: intended, baseLastAppliedSeq };
       },
+      (records) => sameRecords(records, intended),
     );
   }
 
@@ -374,40 +369,6 @@ export class AccountStore {
   private async abortOperation(operationId: string): Promise<void> {
     await this.appendJournal({ type: "abort", id: operationId });
     await this.collectJournal();
-  }
-
-  private narrowMutation(
-    previous: readonly AccountRecord[],
-    next: readonly AccountRecord[],
-    baseLastAppliedSeq: number,
-  ): StoreOperation | null {
-    if (sameRecords(previous, next)) return null;
-    const sameMembershipAndOrder =
-      previous.length === next.length &&
-      previous.every((record, index) => next[index]?.id === record.id);
-    if (sameMembershipAndOrder) {
-      const changed = previous.flatMap((record, index) => {
-        const replacement = next[index];
-        return replacement !== undefined && !sameRecord(record, replacement)
-          ? [{ previous: record, next: replacement }]
-          : [];
-      });
-      const [change] = changed;
-      if (changed.length === 1 && change !== undefined) {
-        if (sameRecord({ ...change.previous, enabled: change.next.enabled }, change.next)) {
-          return { kind: "enable", id: change.next.id, enabled: change.next.enabled };
-        }
-        const retryAt = change.next.retryAt;
-        if (
-          retryAt !== undefined &&
-          retryAt > (change.previous.retryAt ?? 0) &&
-          sameRecord({ ...change.previous, retryAt }, change.next)
-        ) {
-          return { kind: "quarantine", id: change.next.id, retryAtMs: retryAt };
-        }
-      }
-    }
-    return { kind: "state", records: next, baseLastAppliedSeq };
   }
 
   private replay(
