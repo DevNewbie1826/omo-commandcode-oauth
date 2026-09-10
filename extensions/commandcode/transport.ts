@@ -2,10 +2,13 @@
  * Failover transport for the Command Code provider.
  *
  * Wraps the pi-ai anthropic-messages `streamSimple` so that a request which
- * is rate-limited or out of credits BEFORE its first forwarded event is
- * retried on the next account of the shared pool (each account at most once
- * per request), while anything already observed by the consumer is never
- * replayed: once an event has been forwarded, a failure is propagated as-is.
+ * is rate-limited or out of credits — BEFORE its first forwarded event or
+ * AFTER output already flowed — quarantines the dead account (cooldown parsed
+ * via `parseCooldown`, sessions unbound) for FUTURE requests, while the
+ * current request is never retried or replayed: a pre-output failure rotates
+ * to the next account of the shared pool (each account at most once per
+ * request), a post-output failure is propagated as-is after the quarantine
+ * lands, so the next request cannot pick the same dead account again.
  *
  * The real pi-ai adapter reports request failures as a terminal `error`
  * event as the first stream event (HTTP status and body folded into the
@@ -72,9 +75,10 @@ export interface FailoverStreamOptions {
   /** Fire-and-forget billing refresh hook; implementers must not reject. */
   readonly refreshBilling: (apiKey: string) => void;
   /**
-   * Maps an explicit `options.apiKey` to a pool account id. When provided and
-   * the key belongs to the pool, that account is attempted first (pinned);
-   * otherwise rotation starts from `pool.next`.
+   * Maps an explicit `options.apiKey` to a pool account id. Implementations
+   * must only return ids of accounts fit to attempt (enabled, cooldown lapsed,
+   * not already tried); when provided and the key resolves, that account is
+   * attempted first (pinned); otherwise rotation starts from `pool.next`.
    */
   readonly resolveAccountIdByToken?: (token: string) => Promise<string | undefined>;
 }
@@ -99,6 +103,12 @@ type AttemptOutcome =
       readonly cause: FailureCause;
       /** Original terminal error event, replayed only when the failure is not a cooldown. */
       readonly replay?: AssistantMessageEvent;
+    }
+  | {
+      readonly kind: "failed-after-first-event";
+      readonly cause: FailureCause;
+      /** Terminal error event the consumer must still observe; re-emitted after quarantine. */
+      readonly surfaced?: AssistantMessageEvent;
     };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -269,7 +279,14 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
   ): Promise<AttemptOutcome> => {
     let inner: AssistantMessageEventStream;
     try {
-      const result = options.anthropicStreamSimple(model, context, { ...callOptions, apiKey: token });
+      const result = options.anthropicStreamSimple(model, context, {
+        ...callOptions,
+        apiKey: token,
+        // Hosts of authHeader providers inject a preset Authorization header
+        // into callOptions; every attempt must carry the SELECTED account's
+        // credential on the wire instead of the leaked host-pinned one.
+        headers: { ...callOptions?.headers, Authorization: `Bearer ${token}` },
+      });
       inner = result instanceof Promise ? await result : result;
     } catch (error) {
       return { kind: "failed-before-first-event", cause: failureFromThrown(error) };
@@ -277,12 +294,12 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
     let forwarded = false;
     try {
       for await (const event of inner) {
-        if (!forwarded && event.type === "error") {
-          return {
-            kind: "failed-before-first-event",
-            cause: failureFromAssistantMessage(event.error),
-            replay: event,
-          };
+        if (event.type === "error") {
+          const cause = failureFromAssistantMessage(event.error);
+          if (!forwarded) {
+            return { kind: "failed-before-first-event", cause, replay: event };
+          }
+          return { kind: "failed-after-first-event", cause, surfaced: event };
         }
         forwarded = true;
         outer.push(event);
@@ -291,8 +308,7 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
     } catch (error) {
       if (forwarded) {
         // Never replay: the consumer already observed events from this attempt.
-        outer.push(errorMessageEvent(model, messageOf(error), options.now()));
-        return { kind: "completed" };
+        return { kind: "failed-after-first-event", cause: failureFromThrown(error) };
       }
       return { kind: "failed-before-first-event", cause: failureFromThrown(error) };
     }
@@ -330,6 +346,22 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
         }
 
         const decision = options.parseCooldown(cooldownInputOf(outcome.cause, options.now()));
+        if (outcome.kind === "failed-after-first-event") {
+          // Terminal failure after the consumer saw output: quarantine the dead
+          // account for FUTURE requests when it is a cooldown, but never retry
+          // or replay the current one — propagate and stop.
+          if (decision !== null) {
+            await options.pool.quarantine(
+              accountId,
+              decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS,
+            );
+            scheduleBillingRefresh(options, token);
+          }
+          if (outcome.surfaced !== undefined) outer.push(outcome.surfaced);
+          else outer.push(errorMessageEvent(model, outcome.cause.message, options.now()));
+          outer.end();
+          return;
+        }
         if (decision === null) {
           // Not a cooldown (auth error, bad request, abort, …): never retried.
           if (outcome.replay !== undefined) outer.push(outcome.replay);

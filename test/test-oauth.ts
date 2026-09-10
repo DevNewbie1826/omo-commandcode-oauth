@@ -323,6 +323,31 @@ describe("createLogin paste fallback", () => {
   });
 });
 
+describe("createLogin credential persistence", () => {
+  test("Given the onCredential hook rejects, When login runs, Then login awaits the hook and fails with the persistence error instead of issuing credentials", async () => {
+    vi.stubEnv("COMMANDCODE_AUTH_TIMEOUT_MS", "50");
+    const fetchFn = whoamiFetch(whoamiResponse(200));
+    const onCredential = vi.fn<(apiKey: string) => Promise<void>>(async () => {
+      throw new Error("accounts file is not writable");
+    });
+    const login = createLogin({ fetchFn, onCredential });
+    const callbacks = loginCallbacks({ onPrompt: onPromptReturning("pasted-key") });
+
+    let failure: unknown;
+    let credentials: OAuthCredentials | undefined;
+    try {
+      credentials = await login(callbacks);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(onCredential).toHaveBeenCalledTimes(1);
+    expect(onCredential).toHaveBeenCalledWith("pasted-key");
+    expect(credentials).toBeUndefined();
+    expect(assertInstance(failure, Error).message).toContain("accounts file is not writable");
+  });
+});
+
 describe("createLogin key validation", () => {
   test("Given a pasted key the upstream rejects with 401, When login runs, Then it rejects with the non-retryable invalid-key error", async () => {
     vi.stubEnv("COMMANDCODE_AUTH_TIMEOUT_MS", "50");

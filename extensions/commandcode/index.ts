@@ -14,11 +14,12 @@ import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/ev
 import { AccountPool } from "./accounts/pool.js";
 import { AccountStoreError } from "./accounts/schema.js";
 import { AccountStore, resolveAccountsFilePath } from "./accounts/store.js";
-import { createBillingCache, fetchBillingSnapshot } from "./billing.js";
+import { createBillingCache, fetchBillingSnapshot, type BillingSnapshot, type BillingCache } from "./billing.js";
 import { loadModels, type CommandCodeModel } from "./models.js";
 import {
   CommandCodeInvalidKeyError,
   CommandCodeKeyValidationError,
+  CommandCodeLoginError,
   DEFAULT_API_BASE,
   createLogin,
   refreshToken,
@@ -121,6 +122,28 @@ async function addPoolAccount(store: AccountStore, apiKey: string, whoami: Whoam
   });
 }
 
+/**
+ * Resolve a host-pinned `options.apiKey` to a pool account id — but only when
+ * that account is healthy per the store: enabled, cooldown (`retryAt`) lapsed,
+ * and not already tried. The failover transport resolves the pin once, before
+ * any attempt is made, so "not already tried" holds at resolution time; the
+ * transport then falls through to normal pool selection whenever this resolver
+ * declines an account.
+ */
+export function createPinnedAccountResolver(
+  store: AccountStore,
+  now: () => number = Date.now,
+): (token: string) => Promise<string | undefined> {
+  return async (token: string): Promise<string | undefined> => {
+    const records = await store.load();
+    const record = records.find((entry) => entry.token === token);
+    if (record === undefined || !record.enabled) return undefined;
+    const retryAt = record.retryAt;
+    if (retryAt !== undefined && retryAt > now()) return undefined;
+    return record.id;
+  };
+}
+
 function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string): ProviderModelConfig[] {
   return models.map((model) => ({
     id: model.id,
@@ -134,16 +157,64 @@ function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string):
   }));
 }
 
+/**
+ * Refresh one account's billing state: fetch a snapshot, cache it, and persist
+ * the credits into the matching account record so `AccountPool` tier-0
+ * selection can see them. Concurrent refreshes for the same key are deduped
+ * through an in-flight promise map (one fetch per key at a time); the refresher
+ * never rejects — failures are logged and leave the store untouched.
+ */
+export function createBillingRefresher(options: {
+  readonly store: AccountStore;
+  readonly billingCache: BillingCache;
+  readonly fetchBilling?: (apiKey: string) => Promise<BillingSnapshot | undefined>;
+}): (apiKey: string) => Promise<void> {
+  const fetchBilling = options.fetchBilling ?? ((apiKey: string) => fetchBillingSnapshot({ apiKey }));
+  const inFlight = new Map<string, Promise<void>>();
+  return (apiKey: string): Promise<void> => {
+    const existing = inFlight.get(apiKey);
+    if (existing !== undefined) return existing;
+    const task = (async (): Promise<void> => {
+      try {
+        const snapshot = await fetchBilling(apiKey);
+        if (snapshot === undefined) return;
+        options.billingCache.set(apiKey, snapshot);
+        await options.store.mutate((records) =>
+          records.map((record) =>
+            record.token === apiKey
+              ? {
+                  ...record,
+                  credits: {
+                    monthly: snapshot.monthly,
+                    purchased: snapshot.purchased,
+                    free: snapshot.free,
+                    periodEnd: snapshot.periodEnd,
+                  },
+                }
+              : record,
+          ),
+        );
+      } catch (error) {
+        console.debug(`commandcode: could not refresh pool billing state: ${messageOf(error)}`);
+      } finally {
+        inFlight.delete(apiKey);
+      }
+    })();
+    inFlight.set(apiKey, task);
+    return task;
+  };
+}
+
 export default async function commandcodeExtension(pi: CommandCodeHost): Promise<void> {
   const apiBase = resolveApiBase();
+  // The pi-ai anthropic-messages adapter appends `/v1/messages` to the model
+  // baseUrl, so models must carry `{apiBase}/provider` for requests to land on
+  // the Command Code provider plane (`{apiBase}/provider/v1/messages`).
+  const upstreamBaseUrl = `${apiBase}/provider`;
   const store = new AccountStore({ path: resolveAccountsFilePath() });
   const pool = new AccountPool({ store });
   const billingCache = createBillingCache();
-
-  const refreshBillingSnapshot = async (apiKey: string): Promise<void> => {
-    const snapshot = await fetchBillingSnapshot({ apiKey });
-    if (snapshot !== undefined) billingCache.set(apiKey, snapshot);
-  };
+  const refreshBillingSnapshot = createBillingRefresher({ store, billingCache });
 
   const failover =
     anthropicStreamSimple === undefined || createEventStream === undefined
@@ -160,10 +231,7 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
           refreshBilling: (apiKey: string): void => {
             void refreshBillingSnapshot(apiKey);
           },
-          resolveAccountIdByToken: async (token: string): Promise<string | undefined> => {
-            const records = await store.load();
-            return records.find((record) => record.token === token)?.id;
-          },
+          resolveAccountIdByToken: createPinnedAccountResolver(store),
         });
 
   const catalog = await loadModels();
@@ -178,17 +246,19 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
         whoami = info;
         return info;
       },
-      onCredential: (apiKey: string): void => {
-        void addPoolAccount(store, apiKey, whoami).catch((error: unknown) => {
+      onCredential: (apiKey: string): Promise<void> =>
+        addPoolAccount(store, apiKey, whoami).catch((error: unknown) => {
           if (error instanceof AccountStoreError && /already exists/i.test(error.message)) {
             console.debug("commandcode: login credential is already present in the shared account pool");
             return;
           }
-          console.warn(
-            `commandcode: could not add the login credential to the shared account pool: ${messageOf(error)}`,
+          // Persistence failures must fail the login: a credential that never
+          // reached the shared pool would silently vanish for other sessions.
+          throw new CommandCodeLoginError(
+            `Could not add the login credential to the shared account pool: ${messageOf(error)}`,
+            { cause: error },
           );
-        });
-      },
+        }),
     })(callbacks);
   };
 
@@ -196,8 +266,8 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
     name: PROVIDER_NAME,
     api: "anthropic-messages",
     authHeader: true,
-    baseUrl: apiBase,
-    models: toProviderModels(catalog.models, apiBase),
+    baseUrl: upstreamBaseUrl,
+    models: toProviderModels(catalog.models, upstreamBaseUrl),
     ...(failover === undefined ? {} : { streamSimple: failover }),
     oauth: {
       name: PROVIDER_NAME,
