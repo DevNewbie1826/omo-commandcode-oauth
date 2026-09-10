@@ -278,6 +278,7 @@ describe("account store", () => {
       accounts: [
         { id: "a", token: "token-a", enabled: true, createdAt: new Date(BASE).toISOString() },
       ],
+      lastAppliedSeq: expect.any(Number),
     });
   });
 
@@ -334,6 +335,7 @@ describe("account store", () => {
     expect(raw).toEqual({
       version: 1,
       accounts: [{ id: "a", token: "token-a", enabled: true, createdAt: new Date(BASE).toISOString() }],
+      lastAppliedSeq: expect.any(Number),
     });
   });
 
