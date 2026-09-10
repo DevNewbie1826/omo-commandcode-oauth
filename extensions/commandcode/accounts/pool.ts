@@ -9,7 +9,10 @@
  *   `COMMANDCODE_EXPIRY_WINDOW_MS`, default 24h) — sorted by `periodEnd`
  *   ascending, so the account about to expire first gets drained first.
  *   Stale snapshots (`periodEnd` <= now) stay in tier 1.
- * - Tier 1: every other healthy account, in file order.
+ * - Tier 1: every other healthy account, in file order, except that a healthy
+ *   `preferredId` (selection option, e.g. a host-pinned key) sorts first — the
+ *   weakest selection signal: it never displaces a sticky binding or a tier-0
+ *   candidate, and an unhealthy or excluded preferred id is ignored.
  * - Sticky: a bound sessionId keeps its account while it stays healthy;
  *   otherwise the first candidate in tier order is picked and bound.
  * - Quarantine raises an account's `retryAt` (never lowers it) and unbinds
@@ -75,6 +78,12 @@ export interface AccountPoolOptions {
 export interface SelectionOptions {
   readonly sessionId?: string;
   readonly excluded?: ReadonlySet<string>;
+  /**
+   * Weakest-signal tiebreaker (e.g. a host-pinned account): when healthy, it
+   * sorts ahead of other tier-1 candidates — AFTER any healthy sticky binding
+   * and all tier-0 candidates, which always win over it.
+   */
+  readonly preferredId?: string;
 }
 
 /** An account known to carry a credits snapshot (narrowed by the tier-0 predicate). */
@@ -133,7 +142,13 @@ export class AccountPool {
       )
       .sort(byPeriodEndAsc);
     const expiringIds = new Set(expiring.map((record) => record.id));
-    const ordered = [...expiring, ...healthy.filter((record) => !expiringIds.has(record.id))];
+    const tier1 = healthy.filter((record) => !expiringIds.has(record.id));
+    const preferred = tier1.filter((record) => record.id === options.preferredId);
+    const ordered = [
+      ...expiring,
+      ...preferred,
+      ...tier1.filter((record) => record.id !== options.preferredId),
+    ];
 
     const boundId =
       options.sessionId === undefined ? undefined : this.sessionBindings.get(options.sessionId);

@@ -38,6 +38,15 @@ import type { CooldownDecision, ParseCooldownInput } from "./ratelimit.js";
 /** Quarantine fallback when a cooldown decision carries no reset time. */
 const DEFAULT_COOLDOWN_MS = 60_000;
 
+/**
+ * Canonical retry hint the pi-ai adapter appends to folded 429 failure
+ * messages — `… (retry-after-ms: <ms>)`, mirroring `appendRetryAfterMsMarker`
+ * in pi-ai's `utils/retry-hint`. The value is bounded like `parseCooldown`'s
+ * own timestamps: finite, positive, at most the max valid Date epoch ms.
+ */
+const RETRY_AFTER_MS_MARKER = /\(retry-after-ms: (\d+)\)$/;
+const MAX_RETRY_HINT_MS = 8.64e15;
+
 const ZERO_USAGE: Usage = {
   input: 0,
   output: 0,
@@ -76,17 +85,14 @@ export interface FailoverStreamOptions {
   readonly refreshBilling: (apiKey: string) => void;
   /**
    * Maps an explicit `options.apiKey` to a pool account id. Implementations
-   * must only return ids of accounts fit to attempt (enabled, cooldown lapsed,
-   * not already tried); when provided and the key resolves, that account is
-   * attempted first (pinned); otherwise rotation starts from `pool.next`.
+   * must only return ids of accounts fit to attempt (enabled, cooldown lapsed);
+   * when provided and the key resolves, that id is passed to `pool.next` as
+   * `preferredId` — a weakest-signal tiebreaker that sorts first within tier 1
+   * only, AFTER healthy sticky bindings and all tier-0 candidates. An
+   * unhealthy, absent, or already-tried pin falls through to normal selection.
    */
   readonly resolveAccountIdByToken?: (token: string) => Promise<string | undefined>;
 }
-
-type PinnedAccount = {
-  readonly id: string;
-  readonly token: string;
-};
 
 /** Everything `parseCooldown` might need, extracted from either failure style. */
 type FailureCause = {
@@ -145,6 +151,20 @@ function embeddedJsonBody(message: string): Record<string, unknown> | undefined 
   return isRecord(parsed) ? parsed : undefined;
 }
 
+/**
+ * Recover the adapter's retry hint from a folded failure message and express it
+ * as a Retry-After delta-seconds string. The adapter marker carries whole
+ * milliseconds; ceiling keeps the quarantine at or above what upstream asked
+ * for, and `parseCooldown`'s `toRetryAtMs` bound re-validates the result.
+ */
+function retryAfterHintSeconds(message: string): string | undefined {
+  const match = RETRY_AFTER_MS_MARKER.exec(message);
+  if (match === null) return undefined;
+  const ms = Number(match[1]);
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_RETRY_HINT_MS) return undefined;
+  return String(Math.ceil(ms / 1000));
+}
+
 function headersFrom(value: unknown): Record<string, string> | undefined {
   if (value instanceof Headers) {
     const headers: Record<string, string> = {};
@@ -167,10 +187,19 @@ function cooldownBodyOf(cause: FailureCause): unknown {
 }
 
 function cooldownInputOf(cause: FailureCause, nowMs: number): ParseCooldownInput {
+  const headers = headersFrom(cause.headers);
+  const retryAfterHint = retryAfterHintSeconds(cause.message);
   return {
     status: cause.status ?? statusFromMessage(cause.message) ?? 0,
     body: cooldownBodyOf(cause),
-    headers: headersFrom(cause.headers),
+    // The adapter's retry-after-ms marker is the wire's Retry-After equivalent;
+    // injected as a header hint it lands in parseCooldown's documented tier —
+    // after a body rateLimit.reset and a message "resets at" ISO, and ahead of
+    // any literal Retry-After header within that tier.
+    headers:
+      retryAfterHint === undefined
+        ? headers
+        : { ...headers, "retry-after": retryAfterHint },
     now: nowMs,
   };
 }
@@ -253,15 +282,14 @@ export function sessionIdFromContext(context: Context): string {
   return `cc-${fnv1a(`${context.systemPrompt ?? ""}\u0000${anchor}`)}`;
 }
 
-async function resolvePinnedAccount(
+async function resolvePinnedAccountId(
   options: FailoverStreamOptions,
   apiKey: string | undefined,
-): Promise<PinnedAccount | undefined> {
+): Promise<string | undefined> {
   if (apiKey === undefined || apiKey.length === 0 || options.resolveAccountIdByToken === undefined) {
     return undefined;
   }
-  const id = await options.resolveAccountIdByToken(apiKey);
-  return id === undefined ? undefined : { id, token: apiKey };
+  return options.resolveAccountIdByToken(apiKey);
 }
 
 function scheduleBillingRefresh(options: FailoverStreamOptions, apiKey: string): void {
@@ -323,23 +351,19 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
     try {
       const tried = new Set<string>();
       const sessionId = options.sessionIdFromContext(context, callOptions);
-      let pinned = await resolvePinnedAccount(options, callOptions?.apiKey);
+      const pinnedId = await resolvePinnedAccountId(options, callOptions?.apiKey);
       for (;;) {
-        let token: string;
-        let accountId: string;
-        if (pinned !== undefined) {
-          const current = pinned;
-          pinned = undefined; // pinned keys seed the rotation; later attempts come from the pool
-          token = current.token;
-          accountId = current.id;
-        } else {
-          const lease = await options.pool.next(options.now(), { sessionId, excluded: tried });
-          token = lease.token;
-          accountId = lease.id;
-        }
-        tried.add(accountId);
+        // The pin rides inside normal selection as `preferredId`: a healthy
+        // sticky binding or tier-0 candidate still wins, and once the pinned
+        // account is tried (or quarantined mid-request) `excluded` neuters it.
+        const lease = await options.pool.next(options.now(), {
+          sessionId,
+          excluded: tried,
+          ...(pinnedId === undefined ? {} : { preferredId: pinnedId }),
+        });
+        tried.add(lease.id);
 
-        const outcome = await attemptOnce(token, model, context, callOptions, outer);
+        const outcome = await attemptOnce(lease.token, model, context, callOptions, outer);
         if (outcome.kind === "completed") {
           outer.end();
           return;
@@ -352,10 +376,10 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           // or replay the current one — propagate and stop.
           if (decision !== null) {
             await options.pool.quarantine(
-              accountId,
+              lease.id,
               decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS,
             );
-            scheduleBillingRefresh(options, token);
+            scheduleBillingRefresh(options, lease.token);
           }
           if (outcome.surfaced !== undefined) outer.push(outcome.surfaced);
           else outer.push(errorMessageEvent(model, outcome.cause.message, options.now()));
@@ -370,8 +394,8 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           return;
         }
 
-        await options.pool.quarantine(accountId, decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS);
-        scheduleBillingRefresh(options, token);
+        await options.pool.quarantine(lease.id, decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS);
+        scheduleBillingRefresh(options, lease.token);
       }
     } catch (error) {
       outer.push(errorMessageEvent(model, messageOf(error), options.now()));

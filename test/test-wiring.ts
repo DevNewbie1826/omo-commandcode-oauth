@@ -519,6 +519,56 @@ describe("createFailoverStream (real adapter wire)", () => {
     const records = await store.load();
     expect(records.find((record) => record.id === "a")?.retryAt).toBeDefined();
   });
+
+  it("Given the provider answers token-a with 429 and only a Retry-After: 3600 header (no JSON body), When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined for the full hour instead of the 60s default", async () => {
+    const { store, pool, clock } = await setupPool(["a", "b"]);
+    const authorizations: string[] = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      const authorization =
+        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
+      if (authorization !== undefined) authorizations.push(authorization);
+      if (authorization !== "Bearer token-b") {
+        // Deliberately no JSON body: the retry hint must reach the transport
+        // solely through the adapter's canonical message marker.
+        response.writeHead(429, { "retry-after": "3600" });
+        response.end("slow down");
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(ANTHROPIC_SSE_SUCCESS);
+    });
+    staleServers.push(server);
+    const port = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          reject(new Error("Expected the retry-hint server to bind a TCP port"));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+
+    const wireModel: Model<"anthropic-messages"> = {
+      ...MODEL,
+      baseUrl: `http://127.0.0.1:${port}/provider`,
+    };
+    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
+
+    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
+
+    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
+    expect(events.at(-1)?.type).toBe("done");
+    const records = await store.load();
+    // The adapter folds "Retry-After: 3600" into its canonical
+    // "(retry-after-ms: 3600000)" message marker; the transport must persist
+    // the full hour rather than the 60s default quarantine.
+    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS + 3_600_000);
+    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
+  });
 });
 
 describe("pinned options.apiKey", () => {
@@ -566,7 +616,7 @@ describe("pinned options.apiKey", () => {
     expect(events.map((event) => event.type)).toEqual(["start", "done"]);
   });
 
-  it("Given the pinned account is healthy, When the host pins its token, Then the pinned account is used and sticky bindings survive the pinned request", async () => {
+  it("Given a session holds a healthy sticky binding, When the host pins a different healthy token, Then the sticky binding wins over the pin", async () => {
     const { store, pool, clock } = await setupPool(["account1", "account2"]);
     const seen: string[] = [];
     const adapter: StreamSimpleLike = (_model, _context, options) => {
@@ -582,14 +632,70 @@ describe("pinned options.apiKey", () => {
 
     // Seed a sticky session binding on account1.
     await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
-    // The healthy pinned account is attempted first...
+    // The healthy pin must not displace the healthy sticky binding...
     await collect(
       streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky", apiKey: "token-account2" }),
     );
-    // ...and the next unpinned request still resolves through the untouched binding.
+    // ...and the binding survives for the follow-up request.
     await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
 
-    expect(seen).toEqual(["token-account1", "token-account2", "token-account1"]);
+    expect(seen).toEqual(["token-account1", "token-account1", "token-account1"]);
+  });
+
+  it("Given the pinned account is healthy but another account holds tier-0 credits, When the host pins its token, Then the tier-0 account wins over the pin", async () => {
+    const { store, pool, clock } = await setupPool(["plain", "expiring"]);
+    await store.mutate((records) =>
+      records.map((record) =>
+        record.id === "expiring"
+          ? {
+              ...record,
+              credits: { monthly: 10, purchased: 0, free: 0, periodEnd: clock.now() + 3_600_000 },
+            }
+          : record,
+      ),
+    );
+    const seen: string[] = [];
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: (
+        _model: Model<Api>,
+        _context: Context,
+        options?: SimpleStreamOptions,
+      ) => {
+        seen.push(options?.apiKey ?? "");
+        return emit([startEvent(), doneEvent()]);
+      },
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    await collect(streamSimple(MODEL, CONTEXT, { apiKey: "token-plain" }));
+
+    expect(seen).toEqual(["token-expiring"]);
+  });
+
+  it("Given the pinned account is healthy with no sticky binding or tier-0 candidates, When the host pins its token, Then the pin sorts first within tier 1 and binds the session", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    const seen: string[] = [];
+    const adapter: StreamSimpleLike = (_model, _context, options) => {
+      seen.push(options?.apiKey ?? "");
+      return emit([startEvent(), doneEvent()]);
+    };
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: adapter,
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    // The pin overrides tier-1 file order (account1 is first on disk)...
+    await collect(
+      streamSimple(MODEL, CONTEXT, { sessionId: "session-pinned", apiKey: "token-account2" }),
+    );
+    // ...and the pinned selection bound the session for follow-up requests.
+    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-pinned" }));
+
+    expect(seen).toEqual(["token-account2", "token-account2"]);
   });
 });
 
