@@ -14,7 +14,7 @@ import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/ev
 import { AccountPool } from "./accounts/pool.js";
 import { AccountStoreError } from "./accounts/schema.js";
 import { AccountStore, resolveAccountsFilePath } from "./accounts/store.js";
-import { createBillingCache, fetchBillingSnapshot } from "./billing.js";
+import { createBillingCache, fetchBillingSnapshot, type BillingSnapshot, type BillingCache } from "./billing.js";
 import { loadModels, type CommandCodeModel } from "./models.js";
 import {
   CommandCodeInvalidKeyError,
@@ -156,6 +156,54 @@ function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string):
   }));
 }
 
+/**
+ * Refresh one account's billing state: fetch a snapshot, cache it, and persist
+ * the credits into the matching account record so `AccountPool` tier-0
+ * selection can see them. Concurrent refreshes for the same key are deduped
+ * through an in-flight promise map (one fetch per key at a time); the refresher
+ * never rejects — failures are logged and leave the store untouched.
+ */
+export function createBillingRefresher(options: {
+  readonly store: AccountStore;
+  readonly billingCache: BillingCache;
+  readonly fetchBilling?: (apiKey: string) => Promise<BillingSnapshot | undefined>;
+}): (apiKey: string) => Promise<void> {
+  const fetchBilling = options.fetchBilling ?? ((apiKey: string) => fetchBillingSnapshot({ apiKey }));
+  const inFlight = new Map<string, Promise<void>>();
+  return (apiKey: string): Promise<void> => {
+    const existing = inFlight.get(apiKey);
+    if (existing !== undefined) return existing;
+    const task = (async (): Promise<void> => {
+      try {
+        const snapshot = await fetchBilling(apiKey);
+        if (snapshot === undefined) return;
+        options.billingCache.set(apiKey, snapshot);
+        await options.store.mutate((records) =>
+          records.map((record) =>
+            record.token === apiKey
+              ? {
+                  ...record,
+                  credits: {
+                    monthly: snapshot.monthly,
+                    purchased: snapshot.purchased,
+                    free: snapshot.free,
+                    periodEnd: snapshot.periodEnd,
+                  },
+                }
+              : record,
+          ),
+        );
+      } catch (error) {
+        console.debug(`commandcode: could not refresh pool billing state: ${messageOf(error)}`);
+      } finally {
+        inFlight.delete(apiKey);
+      }
+    })();
+    inFlight.set(apiKey, task);
+    return task;
+  };
+}
+
 export default async function commandcodeExtension(pi: CommandCodeHost): Promise<void> {
   const apiBase = resolveApiBase();
   // The pi-ai anthropic-messages adapter appends `/v1/messages` to the model
@@ -165,11 +213,7 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
   const store = new AccountStore({ path: resolveAccountsFilePath() });
   const pool = new AccountPool({ store });
   const billingCache = createBillingCache();
-
-  const refreshBillingSnapshot = async (apiKey: string): Promise<void> => {
-    const snapshot = await fetchBillingSnapshot({ apiKey });
-    if (snapshot !== undefined) billingCache.set(apiKey, snapshot);
-  };
+  const refreshBillingSnapshot = createBillingRefresher({ store, billingCache });
 
   const failover =
     anthropicStreamSimple === undefined || createEventStream === undefined

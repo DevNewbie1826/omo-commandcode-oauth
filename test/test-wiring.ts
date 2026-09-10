@@ -25,7 +25,10 @@ import {
   createFailoverStream,
   type StreamSimpleLike,
 } from "../extensions/commandcode/transport.js";
-import commandcodeExtension, { createPinnedAccountResolver } from "../extensions/commandcode/index.js";
+import commandcodeExtension, {
+  createBillingRefresher,
+  createPinnedAccountResolver,
+} from "../extensions/commandcode/index.js";
 
 const BASE_MS = 1_700_000_000_000;
 const RESET_SECONDS = 1_758_000_000;
@@ -532,6 +535,86 @@ describe("pinned options.apiKey", () => {
     await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
 
     expect(seen).toEqual(["token-account1", "token-account2", "token-account1"]);
+  });
+});
+
+describe("createBillingRefresher", () => {
+  it("Given an expiring-credits snapshot, When the refresh persists it, Then the credits land in the accounts file and tier-0 selection activates", async () => {
+    const { store, pool, clock } = await setupPool(["regular", "expiring"]);
+    const snapshot: BillingSnapshot = {
+      monthly: 10,
+      purchased: 0,
+      free: 5,
+      periodEnd: BASE_MS + 3_600_000,
+    };
+    const fetchBilling = vi.fn<(apiKey: string) => Promise<BillingSnapshot | undefined>>(
+      async (apiKey) => (apiKey === "token-expiring" ? snapshot : undefined),
+    );
+    const refresher = createBillingRefresher({
+      store,
+      billingCache: createBillingCache({ now: clock.now }),
+      fetchBilling,
+    });
+
+    // Without persisted credits the pool cannot see the expiring account.
+    const before = await pool.next(clock.now());
+    expect(before.id).toBe("regular");
+
+    await refresher("token-expiring");
+
+    const records = await store.load();
+    expect(records.find((record) => record.id === "expiring")?.credits).toEqual(snapshot);
+    const after = await pool.next(clock.now());
+    expect(after.id).toBe("expiring");
+  });
+
+  it("Given concurrent refreshes for one key, When they run together, Then billing is fetched once and all callers share the result", async () => {
+    const { store, clock } = await setupPool(["account1"]);
+    const fetchBilling = vi.fn<(apiKey: string) => Promise<BillingSnapshot | undefined>>(async () => ({
+      monthly: 1,
+      purchased: 0,
+      free: 1,
+      periodEnd: BASE_MS + 1,
+    }));
+    const refresher = createBillingRefresher({
+      store,
+      billingCache: createBillingCache({ now: clock.now }),
+      fetchBilling,
+    });
+
+    await Promise.all([
+      refresher("token-account1"),
+      refresher("token-account1"),
+      refresher("token-account1"),
+    ]);
+
+    expect(fetchBilling).toHaveBeenCalledTimes(1);
+    const records = await store.load();
+    expect(records.find((record) => record.id === "account1")?.credits).toBeDefined();
+  });
+
+  it("Given a failing billing fetch, When the refresh runs, Then the refresher never rejects, the store stays untouched, and a later refresh retries", async () => {
+    const { store, clock } = await setupPool(["account1"]);
+    let failing = true;
+    const fetchBilling = vi.fn<(apiKey: string) => Promise<BillingSnapshot | undefined>>(async () => {
+      if (failing) throw new Error("billing offline");
+      return { monthly: 1, purchased: 0, free: 1, periodEnd: BASE_MS + 1 };
+    });
+    const refresher = createBillingRefresher({
+      store,
+      billingCache: createBillingCache({ now: clock.now }),
+      fetchBilling,
+    });
+
+    await expect(refresher("token-account1")).resolves.toBeUndefined();
+    const untouched = await store.load();
+    expect(untouched.find((record) => record.id === "account1")?.credits).toBeUndefined();
+
+    failing = false;
+    await refresher("token-account1");
+    expect(fetchBilling).toHaveBeenCalledTimes(2);
+    const records = await store.load();
+    expect(records.find((record) => record.id === "account1")?.credits).toBeDefined();
   });
 });
 
