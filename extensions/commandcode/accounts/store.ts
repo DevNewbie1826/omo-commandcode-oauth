@@ -331,6 +331,7 @@ export class AccountStore {
   private writeTail: Promise<unknown> = Promise.resolve();
   private readonly clock: () => number;
   private readonly warnedJournalLines = new Set<string>();
+  private lastAppendedOperationSeq: number | undefined;
   private lastReadAppliedSeq = 0;
   private lastReadExists = false;
 
@@ -460,6 +461,11 @@ export class AccountStore {
 
     const operationId = randomUUID();
     await this.appendJournal({ type: "op", id: operationId, operation });
+    const operationSeq = this.lastAppendedOperationSeq;
+    this.lastAppendedOperationSeq = undefined;
+    if (operationSeq === undefined) {
+      throw new AccountStoreError("Accounts journal did not sequence a mutation operation");
+    }
 
     try {
       for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
@@ -496,6 +502,15 @@ export class AccountStore {
           return { records: this.records, winningLineage: operationApplied };
         }
         await this.appendJournal({ type: "abort", id: compactId });
+        const authority = await this.readAuthoritativeVersionSnapshot();
+        // A publisher advances its watermark only across the journal prefix it
+        // replayed. If a peer's authority covers our sequence, that peer
+        // applied this operation before collecting it; later leaf overwrites
+        // must not cause a non-idempotent transform to run again.
+        if (authority !== undefined && operationSeq <= authority.lastAppliedSeq) {
+          this.records = await this.reconcile();
+          return { records: this.records, winningLineage: true };
+        }
       }
     } catch (error) {
       await this.abortOperation(operationId);
@@ -798,6 +813,7 @@ export class AccountStore {
         } finally {
           await handle.close();
         }
+        if (entry.type === "op") this.lastAppendedOperationSeq = seq;
       } catch (error) {
         throw new AccountStoreError(`Could not append accounts journal at ${this.journalPath()}`, {
           cause: error,

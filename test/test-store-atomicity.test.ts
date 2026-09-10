@@ -660,6 +660,35 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
+    "Given a peer absorbs a paused multi-leaf mutation and overwrites one leaf, When the owner loses publication and reconciles, Then the watermark receipt prevents double application",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "peer-absorbed-multi-leaf.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-after-verify", "multi");
+      await mutation.waitForMessage("held-after-verify");
+      mutation.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(path, "a", "normal", "enable", "unused", "true");
+      await expect(peer.onceExited).resolves.toBe(0);
+      const persisted = mutation.waitForMessage("persisted");
+      mutation.signal("SIGCONT");
+      mutation.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+
+      const [record] = await new AccountStore({ path }).load();
+      expect(record?.enabled).toBe(true);
+      expect(record?.credits).toMatchObject({ monthly: 1, purchased: 1 });
+    },
+    30_000,
+  );
+
+  test(
     "Given a monthly increment has published, When a peer changes only credits.free before verification, Then leaf-level verification recognizes the increment without applying it twice",
     async () => {
       const dir = await tempDir();

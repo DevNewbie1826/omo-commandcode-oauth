@@ -199,7 +199,7 @@ try {
       records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
     );
   } else if (
-    ["increment", "toggle", "saturate", "reordered-increment", "free", "add-and-increment"].includes(action)
+    ["increment", "toggle", "multi", "saturate", "reordered-increment", "free", "add-and-increment"].includes(action)
   ) {
     await store.mutate((records) => {
       transformCalls += 1;
@@ -217,6 +217,17 @@ try {
       return withAddition.map((record) => {
         if (record.id !== id) return record;
         if (action === "toggle") return { ...record, enabled: !record.enabled };
+        if (action === "multi") {
+          return {
+            ...record,
+            enabled: !record.enabled,
+            credits: {
+              ...record.credits,
+              monthly: (record.credits?.monthly ?? 0) + 1,
+              purchased: (record.credits?.purchased ?? 0) + 1,
+            },
+          };
+        }
         if (action === "free") {
           return { ...record, credits: { ...record.credits, free: 5 } };
         }
