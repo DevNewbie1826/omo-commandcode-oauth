@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +32,8 @@ function account(id: string, token: string = `token-${id}`): AccountRecordInput 
 interface ChildMessage {
   readonly type: string;
   readonly ids?: readonly string[];
+  readonly name?: string;
+  readonly message?: string;
 }
 
 function caughtOf(fn: () => unknown): unknown {
@@ -43,7 +45,7 @@ function caughtOf(fn: () => unknown): unknown {
 }
 
 describe("cross-process atomicity", () => {
-  test("Given two stores on one path that both load before either writes, When each adds a different account concurrently, Then BOTH accounts persist because the file lock serializes the read-modify-write", async () => {
+  test("Given two stores on one path that both load before either writes, When each adds a different account concurrently, Then BOTH accounts persist because the identity compare-and-rename serializes the read-modify-write", async () => {
     const dir = await tempDir();
     const path = join(dir, "accounts.json");
     const first = new AccountStore({ path });
@@ -78,22 +80,6 @@ describe("cross-process atomicity", () => {
     expect(records.map((record) => record.id)).toEqual(["a"]);
   });
 
-  test("Given a lock file stale beyond the break threshold, When another store persists, Then the stale lock is broken and the add succeeds without waiting out the timeout", async () => {
-    const dir = await tempDir();
-    const path = join(dir, "accounts.json");
-    const lockPath = `${path}.lock`;
-    await writeFile(lockPath, "", "utf-8");
-    const staleMoment = new Date(Date.now() - 60_000);
-    await utimes(lockPath, staleMoment, staleMoment);
-
-    const store = new AccountStore({ path });
-    await store.add(account("a"));
-
-    const records = await new AccountStore({ path }).load();
-    expect(records.map((record) => record.id)).toEqual(["a"]);
-    await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
-  });
-
   test("Given the accounts path sits beneath a plain file, When a store persists, Then the failure throws AccountStoreError and leaves the blocking file intact", async () => {
     const dir = await tempDir();
     const blocker = join(dir, "blocker");
@@ -110,7 +96,7 @@ describe("cross-process atomicity", () => {
   });
 });
 
-describe("cross-process lock ownership", () => {
+describe("cross-process optimistic concurrency", () => {
   interface ManagedChild {
     readonly stdin: NodeJS.WritableStream;
     readonly onceExited: Promise<number>;
@@ -134,7 +120,7 @@ describe("cross-process lock ownership", () => {
         } catch {
           return; // not a protocol line; keep waiting
         }
-        if (!isChildMessage(parsed)) return;
+        if (!isChildMessage(parsed) || parsed.type !== type) return;
         clearTimeout(timeout);
         reader.off("line", onLine);
         resolve(parsed);
@@ -182,20 +168,14 @@ describe("cross-process lock ownership", () => {
   }
 
   test(
-    "Given owner A locks, reads and pauses while its lock ages out, When B steals the lock, persists and releases, and A resumes, Then A detects the broken ownership, re-runs from the read, and BOTH accounts persist",
+    "Given writer A pauses after capturing the file identity and reading, When writer B persists in that window and A resumes, Then A detects the identity conflict, retries from a fresh read, and BOTH accounts persist with no lock or temp residue",
     async () => {
       const dir = await tempDir();
       const path = join(dir, "accounts.json");
-      const lockPath = `${path}.lock`;
 
-      const first = spawnStoreChild(path, "a", "hold");
+      const first = spawnStoreChild(path, "a", "pause-after-read");
       const held = await first.waitForMessage("held-after-read");
       expect(held.ids).toEqual([]);
-
-      // Model the suspended writer's elapsed lease without sleeping: the lock
-      // now looks older than LOCK_STALE_MS even though A is still live.
-      const aged = new Date(Date.now() - 60_000);
-      await utimes(lockPath, aged, aged);
 
       const second = spawnStoreChild(path, "b");
       await expect(second.onceExited).resolves.toBe(0);
@@ -206,31 +186,93 @@ describe("cross-process lock ownership", () => {
 
       const ids = await persistedIds(path);
       expect([...ids].sort()).toEqual(["a", "b"]);
+      // No lock-file machinery, no abandoned temp files: the mutation cycle
+      // leaves exactly the accounts file behind.
       await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
     },
     30_000,
   );
 
   test(
-    "Given a lock aged beyond the stale threshold naming a dead owner, When a fresh process acquires, Then recovery is prompt (inside the acquire timeout), the add persists, and the lock is cleanly released",
+    "Given three writers interleaved across processes — A paused mid-cycle while B and C persist concurrently — When A resumes, Then all three accounts persist",
     async () => {
       const dir = await tempDir();
       const path = join(dir, "accounts.json");
-      const lockPath = `${path}.lock`;
-      await writeFile(lockPath, "999999-dead-owner-token", "utf-8");
-      const aged = new Date(Date.now() - 60_000);
-      await utimes(lockPath, aged, aged);
 
-      const started = Date.now();
-      const child = spawnStoreChild(path, "a");
-      const code = await child.onceExited;
-      const elapsedMs = Date.now() - started;
+      const first = spawnStoreChild(path, "a", "pause-after-read");
+      const held = await first.waitForMessage("held-after-read");
+      expect(held.ids).toEqual([]);
 
-      expect(code).toBe(0);
-      // A failed stale-break would burn the full 5s acquire timeout instead.
-      expect(elapsedMs).toBeLessThan(5_000);
-      await expect(persistedIds(path)).resolves.toEqual(["a"]);
+      // Barrier-sequenced interleaving: B's full mutation cycle completes
+      // while A is parked, then C runs against B's replaced file. Sequencing
+      // through process-exit barriers (never sleeps) keeps the schedule
+      // deterministic; each writer must still survive on a file identity its
+      // initial read never saw.
+      const second = spawnStoreChild(path, "b");
+      await expect(second.onceExited).resolves.toBe(0);
+      const third = spawnStoreChild(path, "c");
+      await expect(third.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["b", "c"]);
+
+      first.stdin.end("resume\n");
+      await expect(first.onceExited).resolves.toBe(0);
+
+      const ids = await persistedIds(path);
+      expect([...ids].sort()).toEqual(["a", "b", "c"]);
       await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given writer A pauses after reading, When the file is externally replaced with a different valid store file and A resumes, Then A's stale write never silently overwrites the replacement — the identity conflict forces a retry that keeps both",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+      const externalAccount = {
+        id: "ext",
+        token: "token-ext",
+        enabled: true,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      };
+
+      const first = spawnStoreChild(path, "a", "pause-after-read");
+      const held = await first.waitForMessage("held-after-read");
+      expect(held.ids).toEqual([]);
+
+      // Replace the file OUTSIDE any store, between A's read and its
+      // verify-and-rename: a content A has never seen.
+      const external = `${JSON.stringify({ version: 1, accounts: [externalAccount] }, null, 2)}\n`;
+      await writeFile(path, external, "utf-8");
+
+      first.stdin.end("resume\n");
+      await expect(first.onceExited).resolves.toBe(0);
+
+      const ids = await persistedIds(path);
+      expect([...ids].sort()).toEqual(["a", "ext"]);
+      // The externally-written credential survived A's stale write attempt.
+      const finalContents = await readFile(path, "utf-8");
+      expect(finalContents).toContain("token-ext");
+      await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given every optimistic-concurrency verification is forced to fail, When a writer exhausts its bounded attempts, Then it fails with a typed concurrent-modification error and leaves no temp or lock residue",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+
+      const child = spawnStoreChild(path, "a", "conflict-forever");
+      const failure = await child.waitForMessage("error");
+      expect(failure.name).toBe("AccountStoreError");
+      expect(failure.message).toMatch(/concurrent/i);
+      await expect(child.onceExited).resolves.toBe(1);
+
+      // No successful write ever landed and every attempt cleaned up: the
+      // directory holds neither the accounts file nor temp/lock residue.
+      await expect(readdir(dir)).resolves.toEqual([]);
     },
     30_000,
   );
