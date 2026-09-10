@@ -519,6 +519,7 @@ describe("createFailoverStream (real adapter wire)", () => {
     const records = await store.load();
     expect(records.find((record) => record.id === "a")?.retryAt).toBeDefined();
   });
+
 });
 
 describe("pinned options.apiKey", () => {
@@ -566,7 +567,7 @@ describe("pinned options.apiKey", () => {
     expect(events.map((event) => event.type)).toEqual(["start", "done"]);
   });
 
-  it("Given the pinned account is healthy, When the host pins its token, Then the pinned account is used and sticky bindings survive the pinned request", async () => {
+  it("Given a session holds a healthy sticky binding, When the host pins a different healthy token, Then the sticky binding wins over the pin", async () => {
     const { store, pool, clock } = await setupPool(["account1", "account2"]);
     const seen: string[] = [];
     const adapter: StreamSimpleLike = (_model, _context, options) => {
@@ -582,14 +583,70 @@ describe("pinned options.apiKey", () => {
 
     // Seed a sticky session binding on account1.
     await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
-    // The healthy pinned account is attempted first...
+    // The healthy pin must not displace the healthy sticky binding...
     await collect(
       streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky", apiKey: "token-account2" }),
     );
-    // ...and the next unpinned request still resolves through the untouched binding.
+    // ...and the binding survives for the follow-up request.
     await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
 
-    expect(seen).toEqual(["token-account1", "token-account2", "token-account1"]);
+    expect(seen).toEqual(["token-account1", "token-account1", "token-account1"]);
+  });
+
+  it("Given the pinned account is healthy but another account holds tier-0 credits, When the host pins its token, Then the tier-0 account wins over the pin", async () => {
+    const { store, pool, clock } = await setupPool(["plain", "expiring"]);
+    await store.mutate((records) =>
+      records.map((record) =>
+        record.id === "expiring"
+          ? {
+              ...record,
+              credits: { monthly: 10, purchased: 0, free: 0, periodEnd: clock.now() + 3_600_000 },
+            }
+          : record,
+      ),
+    );
+    const seen: string[] = [];
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: (
+        _model: Model<Api>,
+        _context: Context,
+        options?: SimpleStreamOptions,
+      ) => {
+        seen.push(options?.apiKey ?? "");
+        return emit([startEvent(), doneEvent()]);
+      },
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    await collect(streamSimple(MODEL, CONTEXT, { apiKey: "token-plain" }));
+
+    expect(seen).toEqual(["token-expiring"]);
+  });
+
+  it("Given the pinned account is healthy with no sticky binding or tier-0 candidates, When the host pins its token, Then the pin sorts first within tier 1 and binds the session", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    const seen: string[] = [];
+    const adapter: StreamSimpleLike = (_model, _context, options) => {
+      seen.push(options?.apiKey ?? "");
+      return emit([startEvent(), doneEvent()]);
+    };
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: adapter,
+      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
+    });
+
+    // The pin overrides tier-1 file order (account1 is first on disk)...
+    await collect(
+      streamSimple(MODEL, CONTEXT, { sessionId: "session-pinned", apiKey: "token-account2" }),
+    );
+    // ...and the pinned selection bound the session for follow-up requests.
+    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-pinned" }));
+
+    expect(seen).toEqual(["token-account2", "token-account2"]);
   });
 });
 

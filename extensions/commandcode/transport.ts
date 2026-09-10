@@ -76,17 +76,14 @@ export interface FailoverStreamOptions {
   readonly refreshBilling: (apiKey: string) => void;
   /**
    * Maps an explicit `options.apiKey` to a pool account id. Implementations
-   * must only return ids of accounts fit to attempt (enabled, cooldown lapsed,
-   * not already tried); when provided and the key resolves, that account is
-   * attempted first (pinned); otherwise rotation starts from `pool.next`.
+   * must only return ids of accounts fit to attempt (enabled, cooldown lapsed);
+   * when provided and the key resolves, that id is passed to `pool.next` as
+   * `preferredId` — a weakest-signal tiebreaker that sorts first within tier 1
+   * only, AFTER healthy sticky bindings and all tier-0 candidates. An
+   * unhealthy, absent, or already-tried pin falls through to normal selection.
    */
   readonly resolveAccountIdByToken?: (token: string) => Promise<string | undefined>;
 }
-
-type PinnedAccount = {
-  readonly id: string;
-  readonly token: string;
-};
 
 /** Everything `parseCooldown` might need, extracted from either failure style. */
 type FailureCause = {
@@ -253,15 +250,14 @@ export function sessionIdFromContext(context: Context): string {
   return `cc-${fnv1a(`${context.systemPrompt ?? ""}\u0000${anchor}`)}`;
 }
 
-async function resolvePinnedAccount(
+async function resolvePinnedAccountId(
   options: FailoverStreamOptions,
   apiKey: string | undefined,
-): Promise<PinnedAccount | undefined> {
+): Promise<string | undefined> {
   if (apiKey === undefined || apiKey.length === 0 || options.resolveAccountIdByToken === undefined) {
     return undefined;
   }
-  const id = await options.resolveAccountIdByToken(apiKey);
-  return id === undefined ? undefined : { id, token: apiKey };
+  return options.resolveAccountIdByToken(apiKey);
 }
 
 function scheduleBillingRefresh(options: FailoverStreamOptions, apiKey: string): void {
@@ -323,23 +319,19 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
     try {
       const tried = new Set<string>();
       const sessionId = options.sessionIdFromContext(context, callOptions);
-      let pinned = await resolvePinnedAccount(options, callOptions?.apiKey);
+      const pinnedId = await resolvePinnedAccountId(options, callOptions?.apiKey);
       for (;;) {
-        let token: string;
-        let accountId: string;
-        if (pinned !== undefined) {
-          const current = pinned;
-          pinned = undefined; // pinned keys seed the rotation; later attempts come from the pool
-          token = current.token;
-          accountId = current.id;
-        } else {
-          const lease = await options.pool.next(options.now(), { sessionId, excluded: tried });
-          token = lease.token;
-          accountId = lease.id;
-        }
-        tried.add(accountId);
+        // The pin rides inside normal selection as `preferredId`: a healthy
+        // sticky binding or tier-0 candidate still wins, and once the pinned
+        // account is tried (or quarantined mid-request) `excluded` neuters it.
+        const lease = await options.pool.next(options.now(), {
+          sessionId,
+          excluded: tried,
+          ...(pinnedId === undefined ? {} : { preferredId: pinnedId }),
+        });
+        tried.add(lease.id);
 
-        const outcome = await attemptOnce(token, model, context, callOptions, outer);
+        const outcome = await attemptOnce(lease.token, model, context, callOptions, outer);
         if (outcome.kind === "completed") {
           outer.end();
           return;
@@ -352,10 +344,10 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           // or replay the current one — propagate and stop.
           if (decision !== null) {
             await options.pool.quarantine(
-              accountId,
+              lease.id,
               decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS,
             );
-            scheduleBillingRefresh(options, token);
+            scheduleBillingRefresh(options, lease.token);
           }
           if (outcome.surfaced !== undefined) outer.push(outcome.surfaced);
           else outer.push(errorMessageEvent(model, outcome.cause.message, options.now()));
@@ -370,8 +362,8 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           return;
         }
 
-        await options.pool.quarantine(accountId, decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS);
-        scheduleBillingRefresh(options, token);
+        await options.pool.quarantine(lease.id, decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS);
+        scheduleBillingRefresh(options, lease.token);
       }
     } catch (error) {
       outer.push(errorMessageEvent(model, messageOf(error), options.now()));
