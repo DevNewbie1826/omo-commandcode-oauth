@@ -251,6 +251,7 @@ const ACCOUNT_RECORD_LEAVES: readonly AccountRecordLeaf[] = [
 
 interface ChangedRecordEffect {
   readonly id: string;
+  readonly base: AccountRecord;
   readonly intended: AccountRecord;
   readonly leaves: readonly AccountRecordLeaf[];
 }
@@ -323,7 +324,7 @@ function describeStateEffect(
     const leaves = ACCOUNT_RECORD_LEAVES.filter(
       (leaf) => !sameRecordLeaf(baseRecord, record, leaf),
     );
-    if (leaves.length > 0) changed.push({ id: record.id, intended: record, leaves });
+    if (leaves.length > 0) changed.push({ id: record.id, base: baseRecord, intended: record, leaves });
   }
 
   return {
@@ -361,9 +362,14 @@ function repairChangedRecord(
   current: AccountRecord,
   change: ChangedRecordEffect,
 ): AccountRecord {
-  const leaves = new Set(change.leaves);
+  // Round-16 lead-approved contract: unified three-way applied-effect completion.
+  // Intended leaves are present, base-valued leaves were erased and are repaired,
+  // and values matching neither belong to a successor lineage and remain untouched.
+  const leaves = new Set(
+    change.leaves.filter((leaf) => sameRecordLeaf(current, change.base, leaf)),
+  );
   const intended = change.intended;
-  const creditChanged = change.leaves.some((leaf) => leaf.startsWith("credits."));
+  const creditChanged = [...leaves].some((leaf) => leaf.startsWith("credits."));
   let credits = current.credits;
   if (creditChanged) {
     if (intended.credits === undefined || current.credits === undefined) {
@@ -552,10 +558,6 @@ export class AccountStore {
           if (result.disposition === "complete") return;
           if (result.disposition === "applied") {
             if (effectPresent(result.records)) return;
-            // If every changed leaf was subsequently erased, preserve the
-            // accepted OCC retry contract without invoking a non-idempotent
-            // transform twice. A partially retained effect is application
-            // evidence and later overlapping writes remain last-writer-wins.
             if (repairAppliedEffect !== undefined && !anyEffectPresent(result.records)) {
               operationFactory = repairAppliedEffect;
               continue;

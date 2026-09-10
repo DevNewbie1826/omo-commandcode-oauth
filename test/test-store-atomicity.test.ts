@@ -43,6 +43,15 @@ async function journalLines(accountsPath: string): Promise<string[]> {
   return contents.flatMap((content) => content.split("\n").filter((line) => line.length > 0));
 }
 
+async function operationDispositions(accountsPath: string) {
+  const contents = await readFile(`${accountsPath}.dispositions`, "utf-8");
+  const dispositions = contents
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => parseAccountOperationDisposition(JSON.parse(line)));
+  return [...new Map(dispositions.map((disposition) => [disposition.opId, disposition])).values()];
+}
+
 async function expectNoTransientResidue(directory: string): Promise<void> {
   const transient = (await readdir(directory)).filter(
     (name) =>
@@ -1126,6 +1135,49 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test.each(["pause-after-write", "pause-after-verify"])(
+    "Given increment A is applied and pauses at %s, When increment B acknowledges the successor value before A completes, Then A recognizes the advanced leaf without a stale repair",
+    async (mode) => {
+      const dir = await tempDir();
+      const path = join(dir, `applied-successor-${mode}.json`);
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const seedReceiptCount = (await operationDispositions(path)).length;
+
+      const first = spawnStoreChild(path, "a", mode, "increment");
+      await first.waitForMessage(mode === "pause-after-write" ? "held-after-write" : "held-after-verify");
+      first.signal("SIGSTOP");
+
+      const second = spawnStoreChild(path, "a", "normal", "increment");
+      const secondPersisted = second.waitForMessage("persisted");
+      await expect(secondPersisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(second.onceExited).resolves.toBe(0);
+      expect((await new AccountStore({ path }).load())[0]?.credits?.monthly).toBe(2);
+
+      const appliedBeforeFirstCompletes = await operationDispositions(path);
+      expect(appliedBeforeFirstCompletes.length).toBeGreaterThanOrEqual(seedReceiptCount + 2);
+      expect(
+        appliedBeforeFirstCompletes.slice(seedReceiptCount).every(({ outcome }) => outcome === "applied"),
+      ).toBe(true);
+
+      const firstPersisted = first.waitForMessage("persisted");
+      first.signal("SIGCONT");
+      first.stdin.end("resume\n");
+      await expect(firstPersisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(first.onceExited).resolves.toBe(0);
+
+      const appliedAfterFirstCompletes = await operationDispositions(path);
+      expect(appliedAfterFirstCompletes).toEqual(appliedBeforeFirstCompletes);
+      expect((await new AccountStore({ path }).load())[0]?.credits?.monthly).toBe(2);
+      await new AccountStore({ path }).add(account("later"));
+      expect((await new AccountStore({ path }).load())[0]?.credits?.monthly).toBe(2);
+    },
+    30_000,
+  );
+
   test.each([
     ["increment", 1, true],
     ["toggle", 0, false],
@@ -1305,7 +1357,7 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
-    "Given a state setter pauses before linking and a later setter fully overwrites it, When the first setter resumes, Then it repairs its erased effect without re-running unrelated transform work",
+    "Given a state setter pauses before linking and a later setter supersedes it, When the first setter resumes, Then the successor remains last-writer-wins without re-running unrelated transform work",
     async () => {
       const dir = await tempDir();
       const path = join(dir, "fully-erased-applied-state.json");
@@ -1329,7 +1381,7 @@ describe("cross-process optimistic concurrency", () => {
       await expect(persisted).resolves.toMatchObject({ ids: ["a"], transformCalls: 1 });
       await expect(first.onceExited).resolves.toBe(0);
       const loaded = await new AccountStore({ path }).load();
-      expect(loaded[0]?.keyName).toBe("first");
+      expect(loaded[0]?.keyName).toBe("second");
       await expect(new AccountStore({ path }).load()).resolves.toEqual(loaded);
     },
     30_000,
