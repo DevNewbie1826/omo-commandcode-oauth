@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseCooldown } from "../extensions/commandcode/ratelimit.js";
+import { parseCooldown, type ParseCooldownInput } from "../extensions/commandcode/ratelimit.js";
 
 const RESET_SECONDS = 1_758_000_000;
 const RESET_MS = RESET_SECONDS * 1000;
@@ -12,6 +12,9 @@ const MAX_DATE_MS = 8.64e15;
 const MAX_DATE_SECONDS = MAX_DATE_MS / 1000;
 const FAR_FUTURE_HTTP_DATE = "Sun, 14 Sep 275760 00:00:00 GMT";
 const OVERFLOW_RETRY_AFTER = "9".repeat(309);
+/** Reviewer schedule: unix-seconds with a sub-ms fraction after *1000. */
+const FRACTIONAL_RESET_SECONDS = 1_700_000_060.1234;
+const FRACTIONAL_RESET_MS = Math.floor(FRACTIONAL_RESET_SECONDS * 1000);
 
 describe("parseCooldown", () => {
   it("Given a 429 RATE_LIMITED body with fiveHour reset, When parseCooldown runs, Then retryAtMs is reset seconds as ms with rate-limit window", () => {
@@ -390,6 +393,177 @@ describe("parseCooldown", () => {
         expect(Number.isNaN(retryAtMs)).toBe(false);
         expect(Math.abs(retryAtMs)).toBeLessThanOrEqual(MAX_DATE_MS);
       }
+    }
+  });
+
+  it("Given rateLimit.reset of -1 and Retry-After 3600, When parseCooldown runs, Then the negative reset is skipped and retryAtMs is now plus 3600000", () => {
+    const decision = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { reset: -1 },
+        },
+      },
+      headers: { "retry-after": "3600" },
+      now: NOW_MS,
+    });
+
+    expect(decision).toEqual({
+      retryAtMs: NOW_MS + 3_600_000,
+      reason: "rate-limit",
+    });
+  });
+
+  it("Given rateLimit.reset 1700000060.1234, When parseCooldown runs, Then retryAtMs is the floored integer millisecond instant", () => {
+    const decision = parseCooldown({
+      status: 429,
+      body: {
+        error: {
+          code: "RATE_LIMITED",
+          rateLimit: { reset: FRACTIONAL_RESET_SECONDS },
+        },
+      },
+    });
+
+    expect(decision).toEqual({
+      retryAtMs: FRACTIONAL_RESET_MS,
+      reason: "rate-limit",
+    });
+    expect(Number.isInteger(FRACTIONAL_RESET_MS)).toBe(true);
+  });
+
+  it("Given a 429 with Retry-After delay-seconds 0.5, When parseCooldown runs, Then retryAtMs is now plus 500 (fractional seconds floor to integer ms)", () => {
+    const decision = parseCooldown({
+      status: 429,
+      body: {},
+      headers: { "retry-after": "0.5" },
+      now: NOW_MS,
+    });
+
+    expect(decision).toEqual({
+      retryAtMs: NOW_MS + 500,
+      reason: "rate-limit",
+    });
+  });
+
+  it("Given a 429 whose message carries a fractional retry-after-ms adapter marker, When parseCooldown runs, Then retryAtMs is now plus the delay floored to integer milliseconds", () => {
+    const decision = parseCooldown({
+      status: 429,
+      body: { error: { message: "429 slow down (retry-after-ms: 1500.9)" } },
+      now: NOW_MS,
+    });
+
+    expect(decision).toEqual({
+      retryAtMs: NOW_MS + 1500,
+      reason: "rate-limit",
+    });
+  });
+
+  it("Given adversarial cooldown hints, When parseCooldown emits a retryAtMs, Then every value is an integer in [0, 8.64e15]", () => {
+    const inputs: readonly ParseCooldownInput[] = [
+      {
+        status: 429,
+        body: { error: { rateLimit: { reset: -1 } } },
+        headers: { "retry-after": "3600" },
+        now: NOW_MS,
+      },
+      {
+        status: 429,
+        body: { error: { rateLimit: { reset: FRACTIONAL_RESET_SECONDS } } },
+      },
+      { status: 429, body: {}, headers: { "retry-after": "0.5" }, now: NOW_MS },
+      {
+        status: 429,
+        body: { error: { message: "429 slow down (retry-after-ms: 1500.9)" } },
+        now: NOW_MS,
+      },
+      { status: 429, body: { error: { rateLimit: { reset: 0 } } } },
+      { status: 429, body: {}, headers: { "retry-after": "0" }, now: NOW_MS },
+      {
+        status: 429,
+        body: { error: { message: "429 slow down (retry-after-ms: 0)" } },
+        now: NOW_MS,
+      },
+      {
+        status: 429,
+        body: { error: { message: "429 slow down (retry-after-ms: 0.9)" } },
+        now: NOW_MS,
+      },
+      { status: 429, body: { error: { rateLimit: { reset: -0.1 } } }, headers: { "retry-after": "1" }, now: NOW_MS },
+      { status: 429, body: { error: { rateLimit: { reset: 1.9 } } } },
+      { status: 429, body: { error: { rateLimit: { reset: 1e308 } } } },
+      { status: 429, body: { error: { rateLimit: { reset: -1e308 } } } },
+      {
+        status: 429,
+        body: { error: { rateLimit: { reset: Number.POSITIVE_INFINITY } } },
+      },
+      {
+        status: 429,
+        body: { error: { rateLimit: { reset: Number.NEGATIVE_INFINITY } } },
+      },
+      { status: 429, body: { error: { rateLimit: { reset: Number.NaN } } } },
+      { status: 429, body: { error: { rateLimit: { reset: Number.MAX_VALUE } } } },
+      { status: 429, body: { error: { rateLimit: { reset: MAX_DATE_SECONDS } } } },
+      {
+        status: 429,
+        body: { error: { rateLimit: { reset: MAX_DATE_SECONDS + 1 } } },
+      },
+      { status: 429, body: {}, headers: { "retry-after": OVERFLOW_RETRY_AFTER }, now: NOW_MS },
+      { status: 429, body: {}, headers: { "Retry-After": FAR_FUTURE_HTTP_DATE } },
+      { status: 429, body: {}, headers: { "retry-after": "1.9" }, now: NOW_MS },
+      { status: 429, body: {}, headers: { "retry-after": "-1" }, now: NOW_MS },
+      {
+        status: 429,
+        body: {
+          error: {
+            code: "RATE_LIMITED",
+            message: `usage limit for your plan ... resets at ${MESSAGE_ISO}`,
+            rateLimit: { reset: -1 },
+          },
+        },
+        headers: { "retry-after": "3600" },
+        now: NOW_MS,
+      },
+      {
+        status: 429,
+        body: {
+          error: {
+            message: "429 slow down (retry-after-ms: 1500.9)",
+            rateLimit: { reset: -1 },
+          },
+        },
+        headers: { "retry-after": "3600" },
+        now: NOW_MS,
+      },
+      { status: 402, body: { error: { rateLimit: { reset: -1 } } } },
+      {
+        status: 402,
+        body: { error: { rateLimit: { reset: FRACTIONAL_RESET_SECONDS } } },
+      },
+      {
+        status: 429,
+        body: {
+          error: {
+            code: "RATE_LIMITED",
+            rateLimit: { window: "daily", reset: -5 },
+          },
+        },
+      },
+      {
+        status: 429,
+        body: { error: { message: `usage limit for your plan ... resets at ${MESSAGE_ISO}` } },
+      },
+    ];
+
+    for (const input of inputs) {
+      const decision = parseCooldown(input);
+      if (decision === null) continue;
+      const retryAtMs = decision.retryAtMs;
+      if (retryAtMs === null) continue;
+      expect(Number.isInteger(retryAtMs)).toBe(true);
+      expect(retryAtMs).toBeGreaterThanOrEqual(0);
+      expect(retryAtMs).toBeLessThanOrEqual(MAX_DATE_MS);
     }
   });
 });

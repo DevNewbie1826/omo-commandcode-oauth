@@ -1,6 +1,10 @@
 const RATE_LIMIT_WINDOWS = ["fiveHour", "daily", "weekly"] as const;
 const USAGE_LIMIT = /usage limit for your plan/i;
 const RESETS_AT = /resets at (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/i;
+/** Adapter-folded delay: `… (retry-after-ms: <ms>)`, integer or fractional. */
+const RETRY_AFTER_MS_MARKER = /\(retry-after-ms: (\d+(?:\.\d+)?)\)$/;
+/** Non-negative delay-seconds, optionally fractional (RFC 9110 is integer-only). */
+const RETRY_AFTER_DELAY_SECONDS = /^\d+(?:\.\d+)?$/;
 /** Max valid Date epoch ms (100,000,000 days from epoch). Larger or non-finite values are invalid. */
 const MAX_DATE_MS = 8.64e15;
 
@@ -54,9 +58,18 @@ function parseWindow(value: unknown): RateLimitWindow | undefined {
   return undefined;
 }
 
+/**
+ * Persistable epoch-ms: a finite integer in [0, MAX_DATE_MS].
+ * Fractional inputs are truncated with Math.floor so eligibility is at most
+ * 1ms early — never late. Negatives, non-finite values, and overflow are
+ * rejected so the caller can fall through to the next hint. Zero is valid
+ * (retry immediately).
+ */
 function toRetryAtMs(value: number): number | undefined {
-  if (!Number.isFinite(value) || Math.abs(value) > MAX_DATE_MS) return undefined;
-  return value;
+  if (!Number.isFinite(value)) return undefined;
+  const ms = Math.floor(value);
+  if (ms < 0 || ms > MAX_DATE_MS) return undefined;
+  return ms;
 }
 
 function unixSecondsToMs(value: unknown): number | undefined {
@@ -97,8 +110,23 @@ function headerValue(
 
 function parseRetryAfter(value: string, now: number): number | undefined {
   const trimmed = value.trim();
-  if (/^\d+$/.test(trimmed)) return toRetryAtMs(now + Number(trimmed) * 1000);
-  return toRetryAtMs(Date.parse(trimmed));
+  // Fractional delay-seconds (e.g. "0.5") become integer ms via Math.floor;
+  // truncation favors eligibility by at most 1ms. Unsigned only.
+  if (RETRY_AFTER_DELAY_SECONDS.test(trimmed)) {
+    return toRetryAtMs(now + Number(trimmed) * 1000);
+  }
+  // HTTP-date must contain letters (RFC 9110 IMF-fixdate). Bare numerics like
+  // "-1" otherwise Date.parse as a plausible epoch and would persist.
+  if (/[a-zA-Z]/.test(trimmed)) return toRetryAtMs(Date.parse(trimmed));
+  return undefined;
+}
+
+function adapterMarkerMs(message: string | undefined, now: number): number | undefined {
+  if (message === undefined) return undefined;
+  const match = RETRY_AFTER_MS_MARKER.exec(message);
+  const raw = match?.[1];
+  if (raw === undefined) return undefined;
+  return toRetryAtMs(now + Number(raw));
 }
 
 function resetMsFrom(
@@ -142,6 +170,7 @@ export function parseCooldown(input: ParseCooldownInput): CooldownDecision | nul
   const retryAtMs =
     unixSecondsToMs(rateLimit?.reset) ??
     messageIsoMs(message) ??
+    adapterMarkerMs(message, now) ??
     (retryAfter === undefined ? undefined : parseRetryAfter(retryAfter, now)) ??
     null;
   const window = parseWindow(rateLimit?.window);
