@@ -585,6 +585,63 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
+    "Given a monthly increment has published, When a peer changes only credits.free before verification, Then leaf-level verification recognizes the increment without applying it twice",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "credit-leaf-verification.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-after-write", "increment");
+      await mutation.waitForMessage("held-after-write");
+      mutation.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(path, "a", "normal", "free");
+      await expect(peer.onceExited).resolves.toBe(0);
+      const persisted = mutation.waitForMessage("persisted");
+      mutation.signal("SIGCONT");
+      mutation.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+
+      const [record] = await new AccountStore({ path }).load();
+      expect(record?.credits).toMatchObject({ monthly: 1, free: 5 });
+    },
+    30_000,
+  );
+
+  test(
+    "Given a transform adds new and increments a before publication verification, When a peer disables new, Then existence verifies the add and the independent increment is not repeated",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "added-record-existence-verification.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-after-write", "add-and-increment");
+      await mutation.waitForMessage("held-after-write");
+      mutation.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(path, "new", "normal", "enable", "unused", "false");
+      await expect(peer.onceExited).resolves.toBe(0);
+      const persisted = mutation.waitForMessage("persisted");
+      mutation.signal("SIGCONT");
+      mutation.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+
+      const records = await new AccountStore({ path }).load();
+      expect(records.find((record) => record.id === "a")?.credits?.monthly).toBe(1);
+      expect(records.find((record) => record.id === "new")?.enabled).toBe(false);
+    },
+    30_000,
+  );
+
+  test(
     "Given a transform returns credits in a different property order after a genuine stale attempt, When its retry publishes structurally equal values, Then verification succeeds after one logical application",
     async () => {
       const dir = await tempDir();

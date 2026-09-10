@@ -173,16 +173,33 @@ try {
     ...(value.length === 0 ? {} : { keyName: value }),
   });
   else if (action === "add-json") await store.add(JSON.parse(value));
+  else if (action === "enable") await store.setEnabled(id, value === "true");
   else if (action === "state") {
     await store.mutate((records) =>
       records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
     );
-  } else if (["increment", "toggle", "saturate", "reordered-increment"].includes(action)) {
+  } else if (
+    ["increment", "toggle", "saturate", "reordered-increment", "free", "add-and-increment"].includes(action)
+  ) {
     await store.mutate((records) => {
       transformCalls += 1;
-      return records.map((record) => {
+      const withAddition = action === "add-and-increment" && !records.some((record) => record.id === "new")
+        ? [
+            ...records,
+            {
+              id: "new",
+              token: "token-new",
+              enabled: true,
+              createdAt: "2023-11-14T22:13:20.000Z",
+            },
+          ]
+        : records;
+      return withAddition.map((record) => {
         if (record.id !== id) return record;
         if (action === "toggle") return { ...record, enabled: !record.enabled };
+        if (action === "free") {
+          return { ...record, credits: { ...record.credits, free: 5 } };
+        }
         const monthly = action === "saturate"
           ? Math.min(3, (record.credits?.monthly ?? 0) + 1)
           : (record.credits?.monthly ?? 0) + 1;

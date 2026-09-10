@@ -101,6 +101,11 @@ interface VersionSnapshot extends DiskSnapshot {
   readonly publicationSeq: number;
 }
 
+interface PersistResult {
+  readonly records: readonly AccountRecord[];
+  readonly winningLineage: boolean;
+}
+
 let processCycleTail: Promise<unknown> = Promise.resolve();
 
 function exclusiveAcrossInstances<T>(task: () => Promise<T>): Promise<T> {
@@ -183,9 +188,15 @@ function parseJournalEntry(value: unknown): JournalEntry {
   throw new AccountStoreError("Expected recognized journal line type");
 }
 
-type AccountRecordField = Exclude<keyof AccountRecord, "id">;
+type AccountRecordField = Exclude<keyof AccountRecord, "id" | "credits">;
+type AccountRecordLeaf =
+  | AccountRecordField
+  | "credits.monthly"
+  | "credits.purchased"
+  | "credits.free"
+  | "credits.periodEnd";
 
-const ACCOUNT_RECORD_FIELDS: readonly AccountRecordField[] = [
+const ACCOUNT_RECORD_LEAVES: readonly AccountRecordLeaf[] = [
   "token",
   "userId",
   "userName",
@@ -193,17 +204,20 @@ const ACCOUNT_RECORD_FIELDS: readonly AccountRecordField[] = [
   "enabled",
   "retryAt",
   "createdAt",
-  "credits",
+  "credits.monthly",
+  "credits.purchased",
+  "credits.free",
+  "credits.periodEnd",
 ];
 
 interface ChangedRecordEffect {
   readonly id: string;
   readonly intended: AccountRecord;
-  readonly fields: readonly AccountRecordField[];
+  readonly leaves: readonly AccountRecordLeaf[];
 }
 
 interface StateEffect {
-  readonly added: readonly AccountRecord[];
+  readonly addedIds: readonly string[];
   readonly removedIds: readonly string[];
   readonly changed: readonly ChangedRecordEffect[];
 }
@@ -221,19 +235,26 @@ function sameCredits(
   );
 }
 
-function sameRecordField(
+function recordLeaf(record: AccountRecord, leaf: AccountRecordLeaf): unknown {
+  if (leaf === "credits.monthly") return record.credits?.monthly;
+  if (leaf === "credits.purchased") return record.credits?.purchased;
+  if (leaf === "credits.free") return record.credits?.free;
+  if (leaf === "credits.periodEnd") return record.credits?.periodEnd;
+  return record[leaf];
+}
+
+function sameRecordLeaf(
   left: AccountRecord,
   right: AccountRecord,
-  field: AccountRecordField,
+  leaf: AccountRecordLeaf,
 ): boolean {
-  if (field === "credits") return sameCredits(left.credits, right.credits);
-  return left[field] === right[field];
+  return recordLeaf(left, leaf) === recordLeaf(right, leaf);
 }
 
 function sameRecord(left: AccountRecord, right: AccountRecord): boolean {
   return (
     left.id === right.id &&
-    ACCOUNT_RECORD_FIELDS.every((field) => sameRecordField(left, right, field))
+    ACCOUNT_RECORD_LEAVES.every((leaf) => sameRecordLeaf(left, right, leaf))
   );
 }
 
@@ -253,23 +274,23 @@ function describeStateEffect(
 ): StateEffect {
   const baseById = new Map(base.map((record) => [record.id, record]));
   const intendedById = new Map(intended.map((record) => [record.id, record]));
-  const added: AccountRecord[] = [];
+  const addedIds: string[] = [];
   const changed: ChangedRecordEffect[] = [];
 
   for (const record of intended) {
     const baseRecord = baseById.get(record.id);
     if (baseRecord === undefined) {
-      added.push(record);
+      addedIds.push(record.id);
       continue;
     }
-    const fields = ACCOUNT_RECORD_FIELDS.filter(
-      (field) => !sameRecordField(baseRecord, record, field),
+    const leaves = ACCOUNT_RECORD_LEAVES.filter(
+      (leaf) => !sameRecordLeaf(baseRecord, record, leaf),
     );
-    if (fields.length > 0) changed.push({ id: record.id, intended: record, fields });
+    if (leaves.length > 0) changed.push({ id: record.id, intended: record, leaves });
   }
 
   return {
-    added,
+    addedIds,
     removedIds: base.filter((record) => !intendedById.has(record.id)).map((record) => record.id),
     changed,
   };
@@ -278,14 +299,11 @@ function describeStateEffect(
 function stateEffectPresent(records: readonly AccountRecord[], effect: StateEffect): boolean {
   const currentById = new Map(records.map((record) => [record.id, record]));
   if (effect.removedIds.some((id) => currentById.has(id))) return false;
-  if (effect.added.some((record) => {
-    const current = currentById.get(record.id);
-    return current === undefined || !sameRecord(current, record);
-  })) return false;
+  if (effect.addedIds.some((id) => !currentById.has(id))) return false;
   return effect.changed.every((change) => {
     const current = currentById.get(change.id);
-    return current !== undefined && change.fields.every(
-      (field) => sameRecordField(current, change.intended, field),
+    return current !== undefined && change.leaves.every(
+      (leaf) => sameRecordLeaf(current, change.intended, leaf),
     );
   });
 }
@@ -390,7 +408,7 @@ export class AccountStore {
   async mutate(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
-    let effect: StateEffect = { added: [], removedIds: [], changed: [] };
+    let effect: StateEffect = { addedIds: [], removedIds: [], changed: [] };
     await this.update(
       (records, baseLastAppliedSeq) => {
         const intended = transform(records);
@@ -414,8 +432,8 @@ export class AccountStore {
     await this.exclusive(() =>
       exclusiveAcrossInstances(async () => {
         for (let attempt = 1; attempt <= MAX_MUTATION_ATTEMPTS; attempt += 1) {
-          const records = await this.persistOperation(createOperation);
-          if (effectPresent(records)) return;
+          const result = await this.persistOperation(createOperation);
+          if (result.winningLineage || effectPresent(result.records)) return;
         }
         throw new AccountStoreError("concurrent modification");
       }),
@@ -427,7 +445,7 @@ export class AccountStore {
       records: readonly AccountRecord[],
       baseLastAppliedSeq: number,
     ) => StoreOperation | null,
-  ): Promise<readonly AccountRecord[]> {
+  ): Promise<PersistResult> {
     let identity = await this.captureIdentity();
     let disk = await this.readDiskSnapshot();
     let journal = await this.readJournal();
@@ -436,7 +454,7 @@ export class AccountStore {
     const operation = createOperation(current, baseSequence);
     if (operation === null || sameRecords(current, applyOperationForComparison(current, operation))) {
       this.records = current;
-      return current;
+      return { records: current, winningLineage: false };
     }
 
     const operationId = randomUUID();
@@ -464,11 +482,17 @@ export class AccountStore {
         const compactSeq = compact.seq;
         if (disk.lastAppliedSeq >= compactSeq) continue;
         const publishRecords = this.replay(disk.records, withCompact.entries, disk.lastAppliedSeq);
+        const operationApplied = this.operationParticipates(
+          disk.records,
+          withCompact.entries,
+          disk.lastAppliedSeq,
+          operationId,
+        );
         if (await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq))) {
           await this.appendJournal({ type: "commit", id: compactId });
           await this.appendJournal({ type: "commit", id: operationId });
           this.records = await this.reconcile();
-          return this.records;
+          return { records: this.records, winningLineage: operationApplied };
         }
         await this.appendJournal({ type: "abort", id: compactId });
       }
@@ -805,6 +829,38 @@ export class AccountStore {
         entry.type === "op" && entry.seq !== undefined ? Math.max(maximum, entry.seq) : maximum,
       floor,
     );
+  }
+
+  private operationParticipates(
+    records: readonly AccountRecord[],
+    entries: readonly JournalEntry[],
+    lastAppliedSeq: number,
+    operationId: string,
+  ): boolean {
+    const aborted = new Set(
+      entries.filter((entry) => entry.type === "abort").map((entry) => entry.id),
+    );
+    let current = records;
+    let highestApplied = lastAppliedSeq;
+    for (const entry of entries) {
+      if (
+        entry.type !== "op" ||
+        entry.seq === undefined ||
+        entry.seq <= lastAppliedSeq ||
+        aborted.has(entry.id)
+      ) continue;
+      if (entry.operation.kind === "state") {
+        const participates = highestApplied <= entry.operation.baseLastAppliedSeq;
+        if (entry.id === operationId) return participates;
+        if (participates) current = entry.operation.records;
+      } else {
+        const next = applyNarrowOperation(current, entry.operation);
+        if (entry.id === operationId) return !sameRecords(current, next);
+        current = next;
+      }
+      highestApplied = Math.max(highestApplied, entry.seq);
+    }
+    return false;
   }
 
   private journalPath(): string {
