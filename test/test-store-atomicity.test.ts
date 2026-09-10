@@ -106,6 +106,7 @@ describe("cross-process optimistic concurrency", () => {
     readonly stdin: NodeJS.WritableStream;
     readonly onceExited: Promise<number>;
     kill(): void;
+    signal(signal: NodeJS.Signals): void;
     waitForMessage(type: string): Promise<ChildMessage>;
   }
 
@@ -181,6 +182,9 @@ describe("cross-process optimistic concurrency", () => {
       onceExited,
       kill: () => {
         child.kill("SIGKILL");
+      },
+      signal: (signal) => {
+        child.kill(signal);
       },
       waitForMessage: (type) => waitForMessage(reader, type),
     };
@@ -610,7 +614,7 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
-    "Given a child is killed while owning the journal lock, When a fresh writer steals the stale lock, Then it succeeds without losing its append",
+    "Given a child is killed while owning the journal lock, When a fresh writer waits for the full default stale threshold, Then it recovers and persists",
     async () => {
       const dir = await tempDir();
       const path = join(dir, "dead-lock.json");
@@ -619,9 +623,34 @@ describe("cross-process optimistic concurrency", () => {
       owner.kill();
       await expect(owner.onceExited).rejects.toThrow(/SIGKILL/);
 
-      const writer = spawnStoreChild(path, "survivor", "steal-lock-now");
+      const writer = spawnStoreChild(path, "survivor");
       await expect(writer.onceExited).resolves.toBe(0);
       await expect(persistedIds(path)).resolves.toEqual(["survivor"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a live GC owner is stopped after reading the journal, When a peer steals the elapsed short lease and adds an account before the owner resumes, Then stale GC re-derives and preserves both acknowledged accounts",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "live-owner-gc.json");
+      const owner = spawnStoreChild(
+        path,
+        "a",
+        "pause-in-gc-after-journal-read,short-stale-lock",
+      );
+      await owner.waitForMessage("held-in-gc-after-journal-read");
+      owner.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(path, "b", "short-stale-lock");
+      await expect(peer.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b"]);
+
+      owner.signal("SIGCONT");
+      owner.stdin.end("resume\n");
+      await expect(owner.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b"]);
     },
     30_000,
   );

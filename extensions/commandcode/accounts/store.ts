@@ -439,59 +439,70 @@ export class AccountStore {
   }
 
   protected async replaceJournalWithEmpty(): Promise<void> {
-    await this.withJournalLock(async () => {
-      const disk = await this.readDiskSnapshotDirect();
-      const journal = await this.readJournal();
-      if (journal.entries.length === 0) return;
-      const committed = new Set(
-        journal.entries.flatMap((entry) => entry.type === "commit" ? [entry.id] : []),
-      );
-      const aborted = new Set(
-        journal.entries.flatMap((entry) => entry.type === "abort" ? [entry.id] : []),
-      );
-      const collectableIds = new Set<string>();
-      for (const entry of journal.entries) {
-        if (entry.type !== "op" || entry.seq === undefined) continue;
-        const publishedCommit =
-          committed.has(entry.id) && entry.seq <= disk.lastAppliedSeq;
-        if (!publishedCommit && !aborted.has(entry.id)) break;
-        collectableIds.add(entry.id);
-      }
-      const retained = journal.entries.filter((entry) => !collectableIds.has(entry.id));
-      if (collectableIds.size === 0) return;
-      const accountTemporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
-      const journalTemporaryPath = `${this.journalPath()}.${process.pid}.${randomUUID()}.tmp`;
-      try {
-        if (disk.exists) {
-          await writeFile(
-            accountTemporaryPath,
-            serializeAccountFile(disk.records, disk.lastAppliedSeq),
-            { encoding: "utf-8", flag: "wx", mode: 0o600 },
-          );
-          await rename(accountTemporaryPath, this.options.path);
-        }
-        if (retained.length === 0) {
-          await rm(this.journalPath(), { force: true });
-        } else {
-          const contents = `${retained.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-          await writeFile(journalTemporaryPath, contents, {
-            encoding: "utf-8",
-            flag: "wx",
-            mode: 0o600,
-          });
-          await rename(journalTemporaryPath, this.journalPath());
-        }
-      } catch (error) {
-        await this.removeTemporary(accountTemporaryPath, error);
-        await this.removeTemporary(journalTemporaryPath, error);
-        throw new AccountStoreError(
-          `Could not garbage-collect accounts journal at ${this.journalPath()}`,
-          { cause: error },
+    for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+      const collected = await this.withJournalLock(async () => {
+        const identity = await this.captureIdentity();
+        const disk = await this.readDiskSnapshotDirect();
+        const journal = await this.readJournal();
+        if (journal.entries.length === 0) return true;
+        const committed = new Set(
+          journal.entries.flatMap((entry) => entry.type === "commit" ? [entry.id] : []),
         );
-      }
-      await this.removeTemporary(accountTemporaryPath);
-      await this.removeTemporary(journalTemporaryPath);
-    });
+        const aborted = new Set(
+          journal.entries.flatMap((entry) => entry.type === "abort" ? [entry.id] : []),
+        );
+        const collectableIds = new Set<string>();
+        for (const entry of journal.entries) {
+          if (entry.type !== "op" || entry.seq === undefined) continue;
+          const publishedCommit =
+            committed.has(entry.id) && entry.seq <= disk.lastAppliedSeq;
+          if (!publishedCommit && !aborted.has(entry.id)) break;
+          collectableIds.add(entry.id);
+        }
+        const retained = journal.entries.filter((entry) => !collectableIds.has(entry.id));
+        if (collectableIds.size === 0) return true;
+        const journalTemporaryPath = `${this.journalPath()}.${process.pid}.${randomUUID()}.tmp`;
+        try {
+          if (retained.length > 0) {
+            const contents = `${retained.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+            await writeFile(journalTemporaryPath, contents, {
+              encoding: "utf-8",
+              flag: "wx",
+              mode: 0o600,
+            });
+          }
+
+          const ownsPublication = disk.exists
+            ? await this.persistCas(
+              identity,
+              serializeAccountFile(disk.records, disk.lastAppliedSeq),
+            )
+            : this.sameIdentity(identity, await this.captureIdentity());
+          if (!ownsPublication || await this.readJournalContents() !== journal.contents) {
+            await this.removeTemporary(journalTemporaryPath);
+            return false;
+          }
+
+          if (retained.length === 0) {
+            await rm(this.journalPath(), { force: true });
+          } else {
+            await rename(journalTemporaryPath, this.journalPath());
+          }
+        } catch (error) {
+          await this.removeTemporary(journalTemporaryPath, error);
+          throw new AccountStoreError(
+            `Could not garbage-collect accounts journal at ${this.journalPath()}`,
+            { cause: error },
+          );
+        }
+        await this.removeTemporary(journalTemporaryPath);
+        return true;
+      });
+      if (collected) return;
+    }
+    throw new AccountStoreError(
+      `Accounts file at ${this.options.path} kept changing while garbage-collecting the journal; concurrent modification`,
+    );
   }
 
   private async readJournal(): Promise<JournalSnapshot> {

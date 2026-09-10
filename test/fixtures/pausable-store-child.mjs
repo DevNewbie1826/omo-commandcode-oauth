@@ -36,6 +36,8 @@ class ScheduledStore extends AccountStore {
   heldWrite = false;
   heldJournal = false;
   heldGc = false;
+  inGc = false;
+  heldGcSnapshot = false;
 
   async pause(type, details = {}) {
     const resumed = once(process.stdin, "data", { signal: AbortSignal.timeout(30_000) });
@@ -105,7 +107,21 @@ class ScheduledStore extends AccountStore {
       this.heldGc = true;
       await this.pause("held-before-gc");
     }
-    await super.replaceJournalWithEmpty();
+    this.inGc = true;
+    try {
+      await super.replaceJournalWithEmpty();
+    } finally {
+      this.inGc = false;
+    }
+  }
+
+  async readJournal() {
+    const snapshot = await super.readJournal();
+    if (modes.has("pause-in-gc-after-journal-read") && this.inGc && !this.heldGcSnapshot) {
+      this.heldGcSnapshot = true;
+      await this.pause("held-in-gc-after-journal-read", { entries: snapshot.entries.length });
+    }
+    return snapshot;
   }
 
   async withJournalLock(task) {
@@ -120,7 +136,11 @@ try {
   const store = new ScheduledStore({
     path,
     now: () => 1_700_000_000_000,
-    journalLockStaleMs: modes.has("steal-lock-now") ? 0 : undefined,
+    journalLockStaleMs: modes.has("steal-lock-now")
+      ? 0
+      : modes.has("short-stale-lock")
+        ? 50
+        : undefined,
   });
   let transformCalls = 0;
   if (action === "load") await store.load();
