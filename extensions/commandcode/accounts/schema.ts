@@ -172,7 +172,9 @@ export function parseAccountFile(value: unknown): AccountFile {
     }
     seenIds.add(account.id);
     if (seenTokens.has(account.token)) {
-      throw new AccountStoreError(`Duplicate account token (…${account.token.slice(-4)})`);
+      // Reference the duplicate's account id only: embedding any token
+      // substring (even a suffix) leaks credential material into error output.
+      throw new AccountStoreError(`Duplicate account token (account id: ${account.id})`);
     }
     seenTokens.add(account.token);
   }
