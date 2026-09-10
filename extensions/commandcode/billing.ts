@@ -1,5 +1,9 @@
+import type { AccountStore } from "./accounts/store.js";
+
 export const DEFAULT_API_BASE = "https://api.commandcode.ai";
 export const DEFAULT_BILLING_TTL_MS = 3_600_000;
+/** Max valid Date epoch ms (100,000,000 days from epoch). */
+const MAX_DATE_MS = 8.64e15;
 
 export class BillingParseError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -19,7 +23,6 @@ export type FetchBillingSnapshotOptions = {
   readonly apiKey: string;
   readonly fetchImpl?: typeof fetch;
   readonly apiBase?: string;
-  readonly now?: () => number;
 };
 
 export type BillingCache = {
@@ -37,6 +40,34 @@ function numberField(record: Record<string, unknown>, key: string): number {
     throw new BillingParseError(`Expected ${key} to be a finite number`);
   }
   return value;
+}
+
+function nonNegativeNumberField(record: Record<string, unknown>, key: string): number {
+  const value = numberField(record, key);
+  if (value < 0) {
+    throw new BillingParseError(`Expected ${key} to be a finite non-negative number`);
+  }
+  return value;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isValidPeriodEnd(value: number): boolean {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_DATE_MS;
+}
+
+function isValidSnapshot(snapshot: BillingSnapshot): boolean {
+  return (
+    Number.isFinite(snapshot.monthly) &&
+    snapshot.monthly >= 0 &&
+    Number.isFinite(snapshot.purchased) &&
+    snapshot.purchased >= 0 &&
+    Number.isFinite(snapshot.free) &&
+    snapshot.free >= 0 &&
+    isValidPeriodEnd(snapshot.periodEnd)
+  );
 }
 
 function stringField(record: Record<string, unknown>, key: string): string {
@@ -76,9 +107,9 @@ function parseCredits(value: unknown): {
   const credits = value.credits;
   if (!isRecord(credits)) throw new BillingParseError("Expected credits to be an object");
   return {
-    monthly: numberField(credits, "monthlyCredits"),
-    purchased: numberField(credits, "purchasedCredits"),
-    free: numberField(credits, "freeCredits"),
+    monthly: nonNegativeNumberField(credits, "monthlyCredits"),
+    purchased: nonNegativeNumberField(credits, "purchasedCredits"),
+    free: nonNegativeNumberField(credits, "freeCredits"),
   };
 }
 
@@ -91,6 +122,9 @@ function parseSubscriptions(value: unknown): number {
   const periodEnd = Date.parse(stringField(record, "currentPeriodEnd"));
   if (Number.isNaN(periodEnd)) {
     throw new BillingParseError("Expected currentPeriodEnd to be an ISO timestamp");
+  }
+  if (!isValidPeriodEnd(periodEnd)) {
+    throw new BillingParseError("Expected currentPeriodEnd to be a finite integer in [0, 8.64e15]");
   }
   return periodEnd;
 }
@@ -125,12 +159,14 @@ export async function fetchBillingSnapshot(
     });
     const subscriptionsPayload = await readJson(subscriptionsResponse, "subscriptions");
     const credits = parseCredits(creditsPayload);
-    return {
+    const snapshot: BillingSnapshot = {
       monthly: credits.monthly,
       purchased: credits.purchased,
       free: credits.free,
       periodEnd: parseSubscriptions(subscriptionsPayload),
     };
+    if (!isValidSnapshot(snapshot)) return undefined;
+    return snapshot;
   } catch (_error: unknown) {
     return undefined;
   }
@@ -159,5 +195,55 @@ export function createBillingCache(
     set(apiKey: string, snapshot: BillingSnapshot): void {
       entries.set(apiKey, { snapshot, storedAt: now() });
     },
+  };
+}
+
+/**
+ * Refresh one account's billing state: fetch a snapshot, cache it, and persist
+ * the credits into the matching account record so `AccountPool` tier-0
+ * selection can see them. The single entry point owns both in-flight dedupe
+ * and TTL freshness (`billingCache.get` hit within `COMMANDCODE_BILLING_TTL_MS`
+ * skips the fetch). The refresher never rejects — failures are logged and
+ * leave the store and cache untouched.
+ */
+export function createBillingRefresher(options: {
+  readonly store: AccountStore;
+  readonly billingCache: BillingCache;
+  readonly fetchBilling?: (apiKey: string) => Promise<BillingSnapshot | undefined>;
+}): (apiKey: string) => Promise<void> {
+  const fetchBilling = options.fetchBilling ?? ((apiKey: string) => fetchBillingSnapshot({ apiKey }));
+  const inFlight = new Map<string, Promise<void>>();
+  return (apiKey: string): Promise<void> => {
+    if (options.billingCache.get(apiKey) !== undefined) return Promise.resolve();
+    const existing = inFlight.get(apiKey);
+    if (existing !== undefined) return existing;
+    const task = (async (): Promise<void> => {
+      try {
+        const snapshot = await fetchBilling(apiKey);
+        if (snapshot === undefined || !isValidSnapshot(snapshot)) return;
+        await options.store.mutate((records) =>
+          records.map((record) =>
+            record.token === apiKey
+              ? {
+                  ...record,
+                  credits: {
+                    monthly: snapshot.monthly,
+                    purchased: snapshot.purchased,
+                    free: snapshot.free,
+                    periodEnd: snapshot.periodEnd,
+                  },
+                }
+              : record,
+          ),
+        );
+        options.billingCache.set(apiKey, snapshot);
+      } catch (error: unknown) {
+        console.debug(`commandcode: could not refresh pool billing state: ${messageOf(error)}`);
+      } finally {
+        inFlight.delete(apiKey);
+      }
+    })();
+    inFlight.set(apiKey, task);
+    return task;
   };
 }
