@@ -17,7 +17,10 @@ import {
   AccountStoreError,
   AccountStoreJournalWarning,
   parseAccountFile,
+  parseAccountOperationDisposition,
   serializeAccountFile,
+  type AccountOperationDisposition,
+  type AccountOperationOutcome,
   type AccountRecord,
   type AccountRecordInput,
 } from "./schema.js";
@@ -76,12 +79,18 @@ type StoreOperation =
     };
 
 type JournalEntry =
-  | { readonly type: "op"; readonly id: string; readonly seq?: number; readonly operation: StoreOperation }
+  | {
+      readonly type: "op";
+      readonly id: string;
+      readonly opId: string;
+      readonly seq?: number;
+      readonly operation: StoreOperation;
+    }
   | { readonly type: "commit"; readonly id: string }
   | { readonly type: "abort"; readonly id: string };
 
 type JournalEntryDraft =
-  | { readonly type: "op"; readonly id: string; readonly operation: StoreOperation }
+  | { readonly type: "op"; readonly id: string; readonly opId: string; readonly operation: StoreOperation }
   | { readonly type: "commit"; readonly id: string }
   | { readonly type: "abort"; readonly id: string };
 
@@ -102,9 +111,16 @@ interface VersionSnapshot extends DiskSnapshot {
   readonly publicationSeq: number;
 }
 
+type MutationDisposition = AccountOperationOutcome | "complete" | "never-applied";
+
 interface PersistResult {
   readonly records: readonly AccountRecord[];
-  readonly winningLineage: boolean;
+  readonly disposition: MutationDisposition;
+}
+
+interface ReplayResult {
+  readonly records: readonly AccountRecord[];
+  readonly dispositions: readonly Omit<AccountOperationDisposition, "version">[];
 }
 
 let processCycleTail: Promise<unknown> = Promise.resolve();
@@ -179,9 +195,12 @@ function parseJournalEntry(value: unknown): JournalEntry {
   const id = requiredJournalString(value, "id");
   if (type === "commit" || type === "abort") return { type, id };
   if (type === "op") {
+    const opIdValue = value["opId"];
     return {
       type,
       id,
+      // Pre-disposition journals used the transaction id as operation identity.
+      opId: opIdValue === undefined ? id : requiredJournalString(value, "opId"),
       seq: parseNonNegativeSequence(value["seq"], 'journal field "seq"'),
       operation: parseOperation(value["operation"]),
     };
@@ -331,7 +350,6 @@ export class AccountStore {
   private writeTail: Promise<unknown> = Promise.resolve();
   private readonly clock: () => number;
   private readonly warnedJournalLines = new Set<string>();
-  private lastAppendedOperationSeq: number | undefined;
   private lastReadAppliedSeq = 0;
   private lastReadExists = false;
 
@@ -435,7 +453,12 @@ export class AccountStore {
       exclusiveAcrossInstances(async () => {
         for (let attempt = 1; attempt <= MAX_MUTATION_ATTEMPTS; attempt += 1) {
           const result = await this.persistOperation(createOperation);
-          if (result.winningLineage || effectPresent(result.records)) return;
+          if (result.disposition === "complete" || result.disposition === "applied") return;
+          if (result.disposition === "rejected-duplicate") {
+            if (effectPresent(result.records)) return;
+            throw new AccountStoreError("Account credential already exists");
+          }
+          if (result.disposition === "skipped-stale" && effectPresent(result.records)) return;
         }
         throw new AccountStoreError("concurrent modification");
       }),
@@ -456,19 +479,20 @@ export class AccountStore {
     const operation = createOperation(current, baseSequence);
     if (operation === null || sameRecords(current, applyOperationForComparison(current, operation))) {
       this.records = current;
-      return { records: current, winningLineage: false };
+      return { records: current, disposition: "complete" };
     }
 
     const operationId = randomUUID();
-    await this.appendJournal({ type: "op", id: operationId, operation });
-    const operationSeq = this.lastAppendedOperationSeq;
-    this.lastAppendedOperationSeq = undefined;
-    if (operationSeq === undefined) {
-      throw new AccountStoreError("Accounts journal did not sequence a mutation operation");
-    }
+    await this.appendJournal({ type: "op", id: operationId, opId: operationId, operation });
 
     try {
       for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+        const settled = await this.operationDisposition(operationId);
+        if (settled !== undefined) {
+          this.records = await this.reconcile();
+          return { records: this.records, disposition: settled.outcome };
+        }
+
         identity = await this.captureIdentity();
         disk = await this.readDiskSnapshot();
         journal = await this.readJournal();
@@ -478,6 +502,7 @@ export class AccountStore {
         await this.appendJournal({
           type: "op",
           id: compactId,
+          opId: compactId,
           operation: { kind: "state", baseLastAppliedSeq: compactBase, records: replayed },
         });
         disk = await this.readDiskSnapshot();
@@ -488,28 +513,37 @@ export class AccountStore {
         if (compact === undefined || compact.type !== "op" || compact.seq === undefined) continue;
         const compactSeq = compact.seq;
         if (disk.lastAppliedSeq >= compactSeq) continue;
-        const publishRecords = this.replay(disk.records, withCompact.entries, disk.lastAppliedSeq);
-        const operationApplied = this.operationParticipates(
+        const publication = this.replayWithDispositions(
           disk.records,
           withCompact.entries,
           disk.lastAppliedSeq,
-          operationId,
         );
-        if (await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq))) {
+        if (await this.persistCas(
+          identity,
+          serializeAccountFile(publication.records, compactSeq),
+          publication.dispositions,
+        )) {
           await this.appendJournal({ type: "commit", id: compactId });
           await this.appendJournal({ type: "commit", id: operationId });
           this.records = await this.reconcile();
-          return { records: this.records, winningLineage: operationApplied };
+          const disposition = await this.operationDisposition(operationId);
+          return {
+            records: this.records,
+            disposition: disposition?.outcome ?? "never-applied",
+          };
         }
         await this.appendJournal({ type: "abort", id: compactId });
-        const authority = await this.readAuthoritativeVersionSnapshot();
-        // A publisher advances its watermark only across the journal prefix it
-        // replayed. If a peer's authority covers our sequence, that peer
-        // applied this operation before collecting it; later leaf overwrites
-        // must not cause a non-idempotent transform to run again.
-        if (authority !== undefined && operationSeq <= authority.lastAppliedSeq) {
+        const disposition = await this.operationDisposition(operationId);
+        if (disposition !== undefined) {
           this.records = await this.reconcile();
-          return { records: this.records, winningLineage: true };
+          return { records: this.records, disposition: disposition.outcome };
+        }
+        const remaining = await this.readJournal();
+        if (!remaining.entries.some(
+          (entry) => entry.type === "op" && entry.opId === operationId,
+        )) {
+          this.records = await this.reconcile();
+          return { records: this.records, disposition: "never-applied" };
         }
       }
     } catch (error) {
@@ -517,6 +551,11 @@ export class AccountStore {
       throw error;
     }
 
+    const disposition = await this.operationDisposition(operationId);
+    if (disposition !== undefined) {
+      this.records = await this.reconcile();
+      return { records: this.records, disposition: disposition.outcome };
+    }
     await this.abortOperation(operationId);
     throw new AccountStoreError(
       `Accounts file at ${this.options.path} kept changing under concurrent writers; gave up after ${MAX_WRITE_ATTEMPTS} attempts`,
@@ -533,23 +572,59 @@ export class AccountStore {
     entries: readonly JournalEntry[],
     lastAppliedSeq = 0,
   ): readonly AccountRecord[] {
+    return this.replayWithDispositions(records, entries, lastAppliedSeq).records;
+  }
+
+  private replayWithDispositions(
+    records: readonly AccountRecord[],
+    entries: readonly JournalEntry[],
+    lastAppliedSeq = 0,
+  ): ReplayResult {
     const aborted = new Set(
       entries.filter((entry) => entry.type === "abort").map((entry) => entry.id),
     );
+    const seenOperations = new Set<string>();
+    const dispositions: Omit<AccountOperationDisposition, "version">[] = [];
     let current = records;
     let highestApplied = lastAppliedSeq;
     for (const entry of entries) {
-      if (entry.type !== "op" || aborted.has(entry.id)) continue;
-      const seq = entry.seq;
-      if (seq !== undefined && seq <= lastAppliedSeq) continue;
-      if (entry.operation.kind === "state") {
-        if (highestApplied <= entry.operation.baseLastAppliedSeq) current = entry.operation.records;
+      if (
+        entry.type !== "op" ||
+        entry.seq === undefined ||
+        entry.seq <= lastAppliedSeq ||
+        aborted.has(entry.id) ||
+        seenOperations.has(entry.opId)
+      ) continue;
+      seenOperations.add(entry.opId);
+
+      const operation = entry.operation;
+      let outcome: AccountOperationOutcome;
+      if (operation.kind === "state") {
+        if (highestApplied <= operation.baseLastAppliedSeq) {
+          current = operation.records;
+          outcome = "applied";
+        } else {
+          outcome = "skipped-stale";
+        }
+      } else if (operation.kind === "add") {
+        const duplicate = current.some(
+          (record) => record.id === operation.record.id || record.token === operation.record.token,
+        );
+        if (duplicate) {
+          outcome = "rejected-duplicate";
+        } else {
+          current = applyNarrowOperation(current, operation);
+          outcome = "applied";
+        }
       } else {
-        current = applyNarrowOperation(current, entry.operation);
+        const targetPresent = current.some((record) => record.id === operation.id);
+        current = applyNarrowOperation(current, operation);
+        outcome = targetPresent || operation.kind === "remove" ? "applied" : "ignored-missing";
       }
-      if (seq !== undefined) highestApplied = Math.max(highestApplied, seq);
+      dispositions.push({ opId: entry.opId, outcome, seq: entry.seq });
+      highestApplied = Math.max(highestApplied, entry.seq);
     }
-    return current;
+    return { records: current, dispositions };
   }
 
   private async reconcile(): Promise<readonly AccountRecord[]> {
@@ -569,6 +644,7 @@ export class AccountStore {
       await this.appendJournal({
         type: "op",
         id: compactId,
+        opId: compactId,
         operation: {
           kind: "state",
           baseLastAppliedSeq: maximumSeq,
@@ -583,18 +659,22 @@ export class AccountStore {
       if (compact === undefined || compact.type !== "op" || compact.seq === undefined) continue;
       const compactSeq = compact.seq;
       if (refreshedDisk.lastAppliedSeq >= compactSeq) continue;
-      const publishRecords = this.replay(
+      const publication = this.replayWithDispositions(
         refreshedDisk.records,
         withCompact.entries,
         refreshedDisk.lastAppliedSeq,
       );
-      if (!(await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq)))) {
+      if (!(await this.persistCas(
+        identity,
+        serializeAccountFile(publication.records, compactSeq),
+        publication.dispositions,
+      ))) {
         await this.appendJournal({ type: "abort", id: compactId });
         continue;
       }
       await this.appendJournal({ type: "commit", id: compactId });
       await this.collectJournal();
-      return publishRecords;
+      return publication.records;
     }
     throw new AccountStoreError(
       `Accounts file at ${this.options.path} kept changing while reconciling the journal`,
@@ -770,6 +850,84 @@ export class AccountStore {
     return contents ?? "";
   }
 
+  private async operationDisposition(
+    opId: string,
+  ): Promise<AccountOperationDisposition | undefined> {
+    const dispositions = await this.readDispositions();
+    return dispositions
+      .filter((disposition) => disposition.opId === opId)
+      .sort((left, right) => right.version - left.version)[0];
+  }
+
+  private async readDispositions(): Promise<readonly AccountOperationDisposition[]> {
+    let contents: string;
+    try {
+      contents = await readFile(this.dispositionsPath(), "utf-8");
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw new AccountStoreError(
+        `Could not read accounts operation dispositions at ${this.dispositionsPath()}`,
+        { cause: error },
+      );
+    }
+
+    const dispositions: AccountOperationDisposition[] = [];
+    const lines = contents.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (line === undefined || line.length === 0) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        dispositions.push(parseAccountOperationDisposition(parsed));
+      } catch (error) {
+        const warningKey = `${this.dispositionsPath()}:${index + 1}:${line}`;
+        if (this.warnedJournalLines.has(warningKey)) continue;
+        this.warnedJournalLines.add(warningKey);
+        this.warn(new AccountStoreJournalWarning(
+          `Ignored malformed accounts operation disposition line ${index + 1} at ${this.dispositionsPath()}`,
+          { cause: error },
+        ));
+      }
+    }
+    return dispositions;
+  }
+
+  private async appendDispositions(
+    drafts: readonly Omit<AccountOperationDisposition, "version">[],
+    version: number,
+  ): Promise<void> {
+    if (drafts.length === 0) return;
+    await this.withJournalLock(async () => {
+      const existing = await this.readDispositions();
+      const settled = new Set(existing.map((disposition) => disposition.opId));
+      const additions = drafts.filter((draft) => !settled.has(draft.opId));
+      if (additions.length === 0) return;
+
+      let contents = "";
+      try {
+        contents = await readFile(this.dispositionsPath(), "utf-8");
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) throw error;
+      }
+      const framing = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
+      const lines = additions.map((draft) => JSON.stringify({ ...draft, version })).join("\n");
+      try {
+        const handle = await open(this.dispositionsPath(), "a", 0o600);
+        try {
+          await handle.chmod(0o600);
+          await handle.appendFile(`${framing}${lines}\n`, "utf-8");
+        } finally {
+          await handle.close();
+        }
+      } catch (error) {
+        throw new AccountStoreError(
+          `Could not append accounts operation dispositions at ${this.dispositionsPath()}`,
+          { cause: error },
+        );
+      }
+    });
+  }
+
   private async readJournalFile(path: string): Promise<string | undefined> {
     try {
       return await readFile(path, "utf-8");
@@ -809,17 +967,24 @@ export class AccountStore {
         const handle = await open(this.journalPath(), "a", 0o600);
         try {
           await handle.chmod(0o600);
-          await handle.appendFile(`${framed}${JSON.stringify(persisted)}\n`, "utf-8");
+          await this.appendJournalBytes(handle, `${framed}${JSON.stringify(persisted)}\n`);
         } finally {
           await handle.close();
         }
-        if (entry.type === "op") this.lastAppendedOperationSeq = seq;
       } catch (error) {
         throw new AccountStoreError(`Could not append accounts journal at ${this.journalPath()}`, {
           cause: error,
         });
       }
     });
+  }
+
+  /** Awaitable boundary for process-level append/rotation scheduling tests. */
+  protected async appendJournalBytes(
+    handle: Awaited<ReturnType<typeof open>>,
+    contents: string,
+  ): Promise<void> {
+    await handle.appendFile(contents, "utf-8");
   }
 
   private async parseJournalContentsWithoutWarnings(contents: string): Promise<readonly JournalEntry[]> {
@@ -848,36 +1013,10 @@ export class AccountStore {
     );
   }
 
-  private operationParticipates(
-    records: readonly AccountRecord[],
-    entries: readonly JournalEntry[],
-    lastAppliedSeq: number,
-    operationId: string,
-  ): boolean {
-    const aborted = new Set(
-      entries.filter((entry) => entry.type === "abort").map((entry) => entry.id),
-    );
-    let current = records;
-    let highestApplied = lastAppliedSeq;
-    for (const entry of entries) {
-      if (
-        entry.type !== "op" ||
-        entry.seq === undefined ||
-        entry.seq <= lastAppliedSeq ||
-        aborted.has(entry.id)
-      ) continue;
-      if (entry.operation.kind === "state") {
-        const participates = highestApplied <= entry.operation.baseLastAppliedSeq;
-        if (entry.id === operationId) return participates;
-        if (participates) current = entry.operation.records;
-      } else {
-        const next = applyNarrowOperation(current, entry.operation);
-        if (entry.id === operationId) return !sameRecords(current, next);
-        current = next;
-      }
-      highestApplied = Math.max(highestApplied, entry.seq);
-    }
-    return false;
+  private dispositionsPath(): string {
+    // This receipt log is never rotated or collected. It grows by at most a
+    // constant number of small records per mutation/publication attempt.
+    return `${this.options.path}.dispositions`;
   }
 
   private journalPath(): string {
@@ -986,7 +1125,11 @@ export class AccountStore {
     }
   }
 
-  protected async persistCas(_expected: FileIdentity, contents: string): Promise<boolean> {
+  protected async persistCas(
+    _expected: FileIdentity,
+    contents: string,
+    dispositions: readonly Omit<AccountOperationDisposition, "version">[] = [],
+  ): Promise<boolean> {
     let parsed: unknown;
     try {
       parsed = JSON.parse(contents);
@@ -1029,6 +1172,10 @@ export class AccountStore {
     const authority = await this.readAuthoritativeVersionSnapshot();
     const won = authority?.name === basename(versionPath);
     if (won) {
+      // Record replay outcomes immediately after the immutable version link.
+      // A crash before this point leaves journal bytes for the next publisher;
+      // after this point the durable opId receipt is authoritative.
+      await this.appendDispositions(dispositions, publicationSeq);
       // Convenience mirror only. A racing, torn, failed, or regressive mirror
       // is harmless because a store that observes versions never falls back to it.
       try {

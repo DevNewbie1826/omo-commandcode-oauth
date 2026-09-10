@@ -272,6 +272,7 @@ describe("account store", () => {
     expect(stats.mode & 0o777).toBe(0o600);
     expect((await readdir(dirname(path))).sort()).toEqual([
       "accounts.json",
+      "accounts.json.dispositions",
       "accounts.v2.json",
     ]);
 

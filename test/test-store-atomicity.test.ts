@@ -10,6 +10,7 @@ import {
   AccountStoreError,
   AccountStoreJournalWarning,
   parseAccountFile,
+  parseAccountOperationDisposition,
 } from "../extensions/commandcode/accounts/schema.js";
 import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 import type { AccountRecordInput } from "../extensions/commandcode/accounts/schema.js";
@@ -57,6 +58,8 @@ interface ChildMessage {
   readonly operation?: { readonly baseLastAppliedSeq?: number };
   readonly candidates?: readonly unknown[];
   readonly transformCalls?: number;
+  readonly inode?: number;
+  readonly nlink?: number;
 }
 
 function caughtOf(fn: () => unknown): unknown {
@@ -491,6 +494,33 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test("Given settled mutations and a torn disposition tail, When another mutation publishes, Then durable opId outcomes remain parseable, framed, and mode 0600", async () => {
+    const dir = await tempDir();
+    const path = join(dir, "disposition-framing.json");
+    const store = new AccountStore({ path, onWarning: () => undefined });
+    await store.add(account("a"));
+    const dispositionsPath = `${path}.dispositions`;
+    const firstContents = await readFile(dispositionsPath, "utf-8");
+    const firstLines = firstContents.split("\n").filter((line) => line.length > 0);
+    expect(firstLines.map((line) => parseAccountOperationDisposition(JSON.parse(line)))).not.toHaveLength(0);
+    expect((await stat(dispositionsPath)).mode & 0o777).toBe(0o600);
+
+    await writeFile(dispositionsPath, '{"opId":', { encoding: "utf-8", flag: "a" });
+    await store.setEnabled("a", false);
+
+    const framed = await readFile(dispositionsPath, "utf-8");
+    const lines = framed.split("\n").filter((line) => line.length > 0);
+    const tornIndex = lines.indexOf('{"opId":');
+    expect(tornIndex).toBeGreaterThanOrEqual(0);
+    const last = lines.at(-1);
+    if (last === undefined || tornIndex === lines.length - 1) {
+      throw new Error("missing disposition after torn tail");
+    }
+    expect(parseAccountOperationDisposition(JSON.parse(last))).toMatchObject({
+      outcome: "applied",
+    });
+  });
+
   test("Given a torn journal tail, When another mutation appends, Then writer-side framing preserves the new operation", async () => {
     const dir = await tempDir();
     const path = join(dir, "accounts.json");
@@ -553,6 +583,142 @@ describe("cross-process optimistic concurrency", () => {
       expect(failure.message).toBe("Account credential already exists");
       await expect(first.onceExited).resolves.toBe(1);
       await expect(persistedIds(path)).resolves.toEqual(["b"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a stale state operation is settled as skipped before its owner loses publication, When the owner completes, Then it retries from fresh state instead of acknowledging the skipped increment",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "skipped-state-disposition.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-op,pause-after-verify",
+        "increment",
+      );
+      await mutation.waitForMessage("held-before-op");
+      await expect(spawnStoreChild(path, "b").onceExited).resolves.toBe(0);
+
+      const heldVerify = mutation.waitForMessage("held-after-verify");
+      mutation.stdin.write("resume\n");
+      await heldVerify;
+      await expect(spawnStoreChild(path, "c").onceExited).resolves.toBe(0);
+
+      const persisted = mutation.waitForMessage("persisted");
+      mutation.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 2 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+      const records = await new AccountStore({ path }).load();
+      expect(records.map((record) => record.id)).toEqual(["a", "b", "c"]);
+      expect(records[0]?.credits?.monthly).toBe(1);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a duplicate add is settled as rejected before its owner loses publication, When the owner completes, Then it throws credential-exists instead of acknowledging another account",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "rejected-add-disposition.json");
+      const mutation = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-op,pause-after-verify",
+        "add",
+        "shared-token",
+      );
+      await mutation.waitForMessage("held-before-op");
+      await expect(
+        spawnStoreChild(path, "b", "normal", "add", "shared-token").onceExited,
+      ).resolves.toBe(0);
+
+      const heldVerify = mutation.waitForMessage("held-after-verify");
+      mutation.stdin.write("resume\n");
+      await heldVerify;
+      await expect(spawnStoreChild(path, "c").onceExited).resolves.toBe(0);
+
+      const failure = mutation.waitForMessage("error");
+      mutation.stdin.end("resume\n");
+      await expect(failure).resolves.toMatchObject({
+        name: "AccountStoreError",
+        message: "Account credential already exists",
+      });
+      await expect(mutation.onceExited).resolves.toBe(1);
+      await expect(persistedIds(path)).resolves.toEqual(["b", "c"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given an operation append completes on a journal inode collected during stale-lease recovery, When its owner loses publication, Then missing disposition evidence retries the transform exactly once",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "unlinked-append-disposition.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-append-file,pause-after-verify,short-stale-lock",
+        "increment",
+      );
+      await mutation.waitForMessage("held-before-append-file");
+      mutation.signal("SIGSTOP");
+      await expect(spawnStoreChild(path, "b", "short-stale-lock").onceExited).resolves.toBe(0);
+
+      const resumedAppend = mutation.waitForMessage("append-file-resumed");
+      const heldVerify = mutation.waitForMessage("held-after-verify");
+      mutation.signal("SIGCONT");
+      mutation.stdin.write("resume\n");
+      await expect(resumedAppend).resolves.toMatchObject({ nlink: 0 });
+      await heldVerify;
+      mutation.signal("SIGSTOP");
+      await expect(spawnStoreChild(path, "c", "short-stale-lock").onceExited).resolves.toBe(0);
+
+      const persisted = mutation.waitForMessage("persisted");
+      mutation.signal("SIGCONT");
+      mutation.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 2 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+      const records = await new AccountStore({ path }).load();
+      expect(records.map((record) => record.id)).toEqual(["a", "b", "c"]);
+      expect(records[0]?.credits?.monthly).toBe(1);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a peer applies a multi-leaf operation before its owner first replays, When the owner resumes, Then its applied disposition prevents a second transform",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "absorbed-before-owner-replay-disposition.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-after-op", "multi");
+      await mutation.waitForMessage("held-after-op");
+      await expect(
+        spawnStoreChild(path, "a", "normal", "enable", "unused", "true").onceExited,
+      ).resolves.toBe(0);
+
+      const persisted = mutation.waitForMessage("persisted");
+      mutation.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+      const [record] = await new AccountStore({ path }).load();
+      expect(record?.credits).toMatchObject({ monthly: 1, purchased: 1 });
     },
     30_000,
   );
@@ -660,7 +826,7 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
-    "Given a peer absorbs a paused multi-leaf mutation and overwrites one leaf, When the owner loses publication and reconciles, Then the watermark receipt prevents double application",
+    "Given a peer absorbs a paused multi-leaf mutation and overwrites one leaf, When the owner loses publication and reconciles, Then the applied disposition prevents double application",
     async () => {
       const dir = await tempDir();
       const path = join(dir, "peer-absorbed-multi-leaf.json");

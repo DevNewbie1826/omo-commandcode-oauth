@@ -9,6 +9,21 @@
 
 export const ACCOUNTS_FILE_VERSION = 1;
 
+export type AccountOperationOutcome =
+  | "applied"
+  | "skipped-stale"
+  | "rejected-duplicate"
+  | "ignored-missing";
+
+/** Durable evidence that one journal operation was settled by a publication. */
+export interface AccountOperationDisposition {
+  readonly opId: string;
+  readonly outcome: AccountOperationOutcome;
+  readonly seq: number;
+  /** Sequence of the immutable accounts version that settled the operation. */
+  readonly version: number;
+}
+
 /**
  * Maximum representable ECMAScript `Date` value in epoch milliseconds. Any
  * persisted timestamp beyond it (or non-integral, negative, or non-finite)
@@ -104,6 +119,42 @@ function optionalBoolean(record: Record<string, unknown>, key: string, context: 
     throw new AccountStoreError(`Expected ${context} field "${key}" to be a boolean`);
   }
   return value;
+}
+
+function requiredNonNegativeSafeInteger(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+): number {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new AccountStoreError(
+      `Expected ${context} field "${key}" to be a non-negative safe integer`,
+    );
+  }
+  return value;
+}
+
+/** Validate one untrusted line from the append-only operation disposition log. */
+export function parseAccountOperationDisposition(value: unknown): AccountOperationDisposition {
+  if (!isRecord(value)) {
+    throw new AccountStoreError("Expected account operation disposition to be an object");
+  }
+  const outcome = value["outcome"];
+  if (
+    outcome !== "applied" &&
+    outcome !== "skipped-stale" &&
+    outcome !== "rejected-duplicate" &&
+    outcome !== "ignored-missing"
+  ) {
+    throw new AccountStoreError("Expected recognized account operation disposition outcome");
+  }
+  return {
+    opId: requiredString(value, "opId", "account operation disposition"),
+    outcome,
+    seq: requiredNonNegativeSafeInteger(value, "seq", "account operation disposition"),
+    version: requiredNonNegativeSafeInteger(value, "version", "account operation disposition"),
+  };
 }
 
 function isValidEpochMs(value: unknown): value is number {

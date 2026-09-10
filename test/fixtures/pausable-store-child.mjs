@@ -35,6 +35,7 @@ class ScheduledStore extends AccountStore {
   heldVerify = false;
   heldWrite = false;
   heldJournal = false;
+  heldAppendFile = false;
   heldBeforeState = false;
   heldAfterState = false;
   heldGc = false;
@@ -87,6 +88,16 @@ class ScheduledStore extends AccountStore {
       await this.pause("held-after-write");
     }
     return landed;
+  }
+
+  async appendJournalBytes(handle, contents) {
+    if (modes.has("pause-before-append-file") && !this.heldAppendFile) {
+      this.heldAppendFile = true;
+      await this.pause("held-before-append-file", { inode: (await handle.stat()).ino });
+      const resumed = await handle.stat();
+      console.log(JSON.stringify({ type: "append-file-resumed", nlink: resumed.nlink }));
+    }
+    await super.appendJournalBytes(handle, contents);
   }
 
   async appendJournal(entry) {
