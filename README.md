@@ -17,6 +17,10 @@
 
 - [omo CLI](https://github.com/code-yeongyu/omo)가 설치되어 있어야 합니다.
 
+### 개발
+
+bun이 별칭 의존성을 중첩 복사하면 `#private` 타입 정체성이 깨질 수 있습니다. `postinstall`이 중복된 중첩 `@earendil-works` 스코프를 자동으로 정리합니다.
+
 ## 설치
 
 GitHub에서 바로 설치:
