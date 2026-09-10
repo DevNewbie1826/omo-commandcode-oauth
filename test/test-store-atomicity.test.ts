@@ -55,6 +55,7 @@ interface ChildMessage {
   readonly name?: string;
   readonly message?: string;
   readonly operation?: { readonly baseLastAppliedSeq?: number };
+  readonly candidates?: readonly unknown[];
   readonly transformCalls?: number;
 }
 
@@ -213,6 +214,52 @@ describe("cross-process optimistic concurrency", () => {
     return records.map((record) => record.id);
   }
 
+  async function raceCollectedVersionScan(
+    path: string,
+    action: "load" | "enable",
+  ): Promise<ChildMessage> {
+    const mirrorOwner = spawnStoreChild(path, "a", "pause-before-mirror");
+    await mirrorOwner.waitForMessage("held-before-mirror");
+    mirrorOwner.signal("SIGSTOP");
+
+    const disable = spawnStoreChild(path, "a", "normal", "enable", "unused", "false");
+    await expect(disable.onceExited).resolves.toBe(0);
+    for (const id of ["c", "d"]) {
+      const peer = spawnStoreChild(path, id);
+      await expect(peer.onceExited).resolves.toBe(0);
+    }
+
+    const target = spawnStoreChild(
+      path,
+      "a",
+      "pause-after-version-scan",
+      action,
+      "unused",
+      action === "enable" ? "true" : undefined,
+    );
+    const scan = await target.waitForMessage("held-after-version-scan");
+    expect(scan.candidates).toHaveLength(3);
+    target.signal("SIGSTOP");
+
+    for (const id of ["e", "f", "g"]) {
+      const peer = spawnStoreChild(path, id);
+      await expect(peer.onceExited).resolves.toBe(0);
+    }
+
+    const mirrorDone = mirrorOwner.waitForMessage("persisted");
+    mirrorOwner.signal("SIGCONT");
+    mirrorOwner.stdin.end("resume\n");
+    await expect(mirrorDone).resolves.toMatchObject({ type: "persisted" });
+    await expect(mirrorOwner.onceExited).resolves.toBe(0);
+
+    const targetDone = target.waitForMessage("persisted");
+    target.signal("SIGCONT");
+    target.stdin.end("resume\n");
+    const result = await targetDone;
+    await expect(target.onceExited).resolves.toBe(0);
+    return result;
+  }
+
   test(
     "Given writer A pauses after capturing the file identity and reading, When writer B persists in that window and A resumes, Then A detects the identity conflict, retries from a fresh read, and BOTH accounts persist with no lock or temp residue",
     async () => {
@@ -348,6 +395,34 @@ describe("cross-process optimistic concurrency", () => {
 
       await new AccountStore({ path }).add(account("later"));
       await expect(persistedIds(path)).resolves.toEqual(["a", "b", "c", "d", "e", "later"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a setter's complete version scan is collected and the mirror regresses, When selection resumes, Then it never acknowledges a no-op from the mirror",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "collected-scan-setter.json");
+
+      const setter = await raceCollectedVersionScan(path, "enable");
+
+      expect(setter.ids).toEqual(["a", "c", "d", "e", "f", "g"]);
+      const records = await new AccountStore({ path }).load();
+      expect(records.find((record) => record.id === "a")?.enabled).toBe(true);
+    },
+    30_000,
+  );
+
+  test(
+    "Given acknowledged records predate a load whose complete version scan is collected, When a stale mirror lands before selection resumes, Then load never returns the mirror's pre-invocation state",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "collected-scan-load.json");
+
+      const loaded = await raceCollectedVersionScan(path, "load");
+
+      expect(loaded.ids).toEqual(["a", "c", "d", "e", "f", "g"]);
     },
     30_000,
   );

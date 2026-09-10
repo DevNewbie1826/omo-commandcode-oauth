@@ -41,6 +41,8 @@ class ScheduledStore extends AccountStore {
   inGc = false;
   heldGcSnapshot = false;
   heldGcRotation = false;
+  heldReaderScan = false;
+  heldMirror = false;
 
   async pause(type, details = {}) {
     const resumed = once(process.stdin, "data", { signal: AbortSignal.timeout(30_000) });
@@ -135,6 +137,24 @@ class ScheduledStore extends AccountStore {
     if (modes.has("pause-in-gc-after-journal-read") && this.inGc && !this.heldGcSnapshot) {
       this.heldGcSnapshot = true;
       await this.pause("held-in-gc-after-journal-read", { entries: snapshot.entries.length });
+    }
+    return snapshot;
+  }
+
+  async versionCandidates() {
+    const candidates = await super.versionCandidates();
+    if (modes.has("pause-after-version-scan") && !this.inCas && !this.inGc && !this.heldReaderScan) {
+      this.heldReaderScan = true;
+      await this.pause("held-after-version-scan", { candidates });
+    }
+    return candidates;
+  }
+
+  async readAuthoritativeVersionSnapshot() {
+    const snapshot = await super.readAuthoritativeVersionSnapshot();
+    if (modes.has("pause-before-mirror") && this.inCas && !this.heldMirror) {
+      this.heldMirror = true;
+      await this.pause("held-before-mirror", { snapshot });
     }
     return snapshot;
   }

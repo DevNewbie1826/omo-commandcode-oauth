@@ -49,6 +49,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const MAX_WRITE_ATTEMPTS = 8;
 const MAX_MUTATION_ATTEMPTS = 4;
+const MAX_VERSION_SELECTION_ATTEMPTS = 8;
 const DEFAULT_JOURNAL_LOCK_STALE_MS = 15_000;
 const MAX_JOURNAL_LOCK_ATTEMPTS = 10_000;
 const JOURNAL_LOCK_RETRY_MS = 2;
@@ -1012,8 +1013,8 @@ export class AccountStore {
     const authority = await this.readAuthoritativeVersionSnapshot();
     const won = authority?.name === basename(versionPath);
     if (won) {
-      // Convenience mirror only. A racing, torn, or failed mirror is harmless
-      // because all store reads select an immutable version whenever one exists.
+      // Convenience mirror only. A racing, torn, failed, or regressive mirror
+      // is harmless because a store that observes versions never falls back to it.
       try {
         await writeFile(this.options.path, contents, { encoding: "utf-8", mode: 0o600 });
       } catch (error) {
@@ -1111,43 +1112,61 @@ export class AccountStore {
   }
 
   private async readAuthoritativeVersionSnapshot(): Promise<VersionSnapshot | undefined> {
-    let authority: VersionSnapshot | undefined;
-    for (const candidate of await this.versionCandidates()) {
-      let contents: string;
-      try {
-        contents = await readFile(candidate.path, "utf-8");
-      } catch (error) {
-        if (hasErrorCode(error, "ENOENT")) continue;
-        throw new AccountStoreError(`Could not read accounts version at ${candidate.path}`, {
-          cause: error,
-        });
+    let observedVersions = false;
+    for (let attempt = 1; attempt <= MAX_VERSION_SELECTION_ATTEMPTS; attempt += 1) {
+      const candidates = [...await this.versionCandidates()].sort(
+        (left, right) => right.publicationSeq - left.publicationSeq || right.name.localeCompare(left.name),
+      );
+      if (candidates.length === 0) {
+        if (!observedVersions) return undefined;
+        throw new AccountStoreError(
+          `Could not select an authoritative accounts version at ${this.options.path}; versions disappeared during selection`,
+        );
       }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(contents);
-      } catch (error) {
-        throw new AccountStoreError(`Accounts version at ${candidate.path} is not valid JSON`, {
-          cause: error,
-        });
+      observedVersions = true;
+
+      let authority: VersionSnapshot | undefined;
+      for (const candidate of candidates) {
+        let contents: string;
+        try {
+          contents = await readFile(candidate.path, "utf-8");
+        } catch (error) {
+          if (hasErrorCode(error, "ENOENT")) continue;
+          throw new AccountStoreError(`Could not read accounts version at ${candidate.path}`, {
+            cause: error,
+          });
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(contents);
+        } catch (error) {
+          throw new AccountStoreError(`Accounts version at ${candidate.path} is not valid JSON`, {
+            cause: error,
+          });
+        }
+        const file = parseAccountFile(parsed);
+        const snapshot: VersionSnapshot = {
+          name: candidate.name,
+          path: candidate.path,
+          publicationSeq: candidate.publicationSeq,
+          records: file.accounts,
+          lastAppliedSeq: file.lastAppliedSeq ?? 0,
+          exists: true,
+        };
+        if (
+          authority === undefined ||
+          snapshot.publicationSeq > authority.publicationSeq ||
+          (snapshot.publicationSeq === authority.publicationSeq &&
+            (snapshot.lastAppliedSeq > authority.lastAppliedSeq ||
+              (snapshot.lastAppliedSeq === authority.lastAppliedSeq && snapshot.name > authority.name)))
+        ) authority = snapshot;
       }
-      const file = parseAccountFile(parsed);
-      const snapshot: VersionSnapshot = {
-        name: candidate.name,
-        path: candidate.path,
-        publicationSeq: candidate.publicationSeq,
-        records: file.accounts,
-        lastAppliedSeq: file.lastAppliedSeq ?? 0,
-        exists: true,
-      };
-      if (
-        authority === undefined ||
-        snapshot.publicationSeq > authority.publicationSeq ||
-        (snapshot.publicationSeq === authority.publicationSeq &&
-          (snapshot.lastAppliedSeq > authority.lastAppliedSeq ||
-            (snapshot.lastAppliedSeq === authority.lastAppliedSeq && snapshot.name > authority.name)))
-      ) authority = snapshot;
+      if (authority !== undefined) return authority;
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    return authority;
+    throw new AccountStoreError(
+      `Could not select an authoritative accounts version at ${this.options.path} after ${MAX_VERSION_SELECTION_ATTEMPTS} attempts`,
+    );
   }
 
   private async versionCandidates(): Promise<readonly {
