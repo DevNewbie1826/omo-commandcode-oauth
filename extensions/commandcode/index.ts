@@ -19,6 +19,7 @@ import { loadModels, type CommandCodeModel } from "./models.js";
 import {
   CommandCodeInvalidKeyError,
   CommandCodeKeyValidationError,
+  CommandCodeLoginError,
   DEFAULT_API_BASE,
   createLogin,
   refreshToken,
@@ -245,17 +246,19 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
         whoami = info;
         return info;
       },
-      onCredential: (apiKey: string): void => {
-        void addPoolAccount(store, apiKey, whoami).catch((error: unknown) => {
+      onCredential: (apiKey: string): Promise<void> =>
+        addPoolAccount(store, apiKey, whoami).catch((error: unknown) => {
           if (error instanceof AccountStoreError && /already exists/i.test(error.message)) {
             console.debug("commandcode: login credential is already present in the shared account pool");
             return;
           }
-          console.warn(
-            `commandcode: could not add the login credential to the shared account pool: ${messageOf(error)}`,
+          // Persistence failures must fail the login: a credential that never
+          // reached the shared pool would silently vanish for other sessions.
+          throw new CommandCodeLoginError(
+            `Could not add the login credential to the shared account pool: ${messageOf(error)}`,
+            { cause: error },
           );
-        });
-      },
+        }),
     })(callbacks);
   };
 

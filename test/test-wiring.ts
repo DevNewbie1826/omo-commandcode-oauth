@@ -673,6 +673,55 @@ describe("createBillingRefresher", () => {
   });
 });
 
+describe("commandcode login persistence", () => {
+  it("Given an unwritable accounts path, When login completes with a valid key, Then the persistence failure fails the login", async () => {
+    const dir = await tempDir();
+    const blocker = join(dir, "not-a-directory");
+    await writeFile(blocker, "regular file, so mkdir below fails", "utf-8");
+    vi.stubEnv("COMMANDCODE_API_BASE", "http://127.0.0.1:1");
+    vi.stubEnv("COMMANDCODE_MODELS_CACHE", join(dir, "models.json"));
+    vi.stubEnv("COMMANDCODE_ACCOUNTS_FILE", join(blocker, "accounts.json"));
+    stubWhoamiApi();
+
+    type Registered = { name: string; config: ProviderConfig };
+    type Host = { registerProvider(name: string, config: ProviderConfig): void };
+    let captured: Registered | undefined;
+    const pi: Host = {
+      registerProvider(name, config) {
+        captured = { name, config };
+      },
+    };
+    await commandcodeExtension(pi);
+    const login = captured?.config.oauth?.login;
+    if (login === undefined) throw new Error("Expected the provider to register oauth login");
+
+    const { onAuth, url: authUrlPromise } = onAuthSignal();
+    const callbacks: OAuthLoginCallbacks = {
+      onAuth,
+      onDeviceCode: () => undefined,
+      onPrompt: async () => "",
+      onSelect: async () => undefined,
+    };
+    const pending = login(callbacks);
+
+    const authUrl = await authUrlPromise;
+    const parsed = new URL(authUrl);
+    const callbackUrl = parsed.searchParams.get("callback") ?? "";
+    const response = await fetch(
+      `${callbackUrl}?${new URLSearchParams({
+        apiKey: "cc-key",
+        state: parsed.searchParams.get("state") ?? "",
+        userId: "u-1",
+        userName: "tester",
+        keyName: "cli",
+      })}`,
+    );
+    expect(response.status).toBe(200);
+
+    await expect(pending).rejects.toThrow(/account pool/i);
+  });
+});
+
 describe("commandcode registerProvider", () => {
   it("Given fetch is disabled via env, When the extension registers, Then oauth.login is a function, api is anthropic-messages, and models is non-empty", async () => {
     const dir = await tempDir();

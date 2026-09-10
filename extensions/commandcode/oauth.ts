@@ -58,7 +58,8 @@ export type ValidateApiKey = (apiKey: string) => Promise<WhoamiInfo>;
 export type CreateLoginOptions = {
   readonly validate?: ValidateApiKey;
   readonly fetchFn?: typeof fetch;
-  readonly onCredential?: (apiKey: string) => void;
+  /** Persisted-credential hook; awaited by the login flow, so a rejection fails the login. */
+  readonly onCredential?: (apiKey: string) => void | Promise<void>;
   readonly apiBase?: string;
   readonly studioBase?: string;
   readonly authTimeoutMs?: number;
@@ -72,7 +73,7 @@ type ResolvedLoginOptions = {
   readonly authTimeoutMs: number;
   readonly now: () => number;
   readonly validate: ValidateApiKey;
-  readonly onCredential: ((apiKey: string) => void) | undefined;
+  readonly onCredential: ((apiKey: string) => void | Promise<void>) | undefined;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -206,7 +207,9 @@ async function loginInBrowser(
   const apiKey = await obtainApiKey(callbacks, waitForCallback, server, options.authTimeoutMs);
   await options.validate(apiKey);
   const credentials = credentialsFromApiKey(apiKey, options.now);
-  options.onCredential?.(apiKey);
+  // Awaited so persistence failures (e.g. an unwritable accounts file) fail the
+  // login instead of silently dropping the credential.
+  await options.onCredential?.(apiKey);
   return credentials;
 }
 
