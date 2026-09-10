@@ -59,7 +59,10 @@ interface ChildMessage {
   readonly ids?: readonly string[];
   readonly name?: string;
   readonly message?: string;
-  readonly operation?: { readonly baseLastAppliedSeq?: number };
+  readonly operation?: {
+    readonly baseLastAppliedSeq?: number;
+    readonly baseRecords?: readonly { readonly id: string; readonly enabled: boolean }[];
+  };
   readonly candidates?: readonly unknown[];
   readonly transformCalls?: number;
   readonly inode?: number;
@@ -932,6 +935,108 @@ describe("cross-process optimistic concurrency", () => {
       if (action === "enable") expect(final.find((record) => record.id === "a")?.enabled).toBe(false);
       if (action === "remove") expect(final.some((record) => record.id === "a")).toBe(false);
       if (action === "add") expect(final.some((record) => record.id === "d")).toBe(true);
+      await expectNoTransientResidue(dir);
+    },
+    30_000,
+  );
+
+  test.each(["enable", "remove", "add"] as const)(
+    "Given a live lower-sequence %s is delayed until an unrelated user transform observes a higher sequence, When the delayed operation appends before the transform, Then the transform retries from that actual base and preserves both effects",
+    async (action) => {
+      const dir = await tempDir();
+      const path = join(dir, `claimed-sequence-user-state-${action}.json`);
+      const seed = new AccountStore({ path });
+      for (const id of ["a", "b"]) {
+        await seed.add({
+          id,
+          token: `token-${id}`,
+          credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+        });
+      }
+
+      const delayed = spawnStoreChild(
+        path,
+        action === "add" ? "d" : "a",
+        "pause-before-append-file,pause-after-op,short-stale-lock",
+        action,
+        action === "add" ? "token-d" : "unused",
+        action === "enable" ? "false" : undefined,
+      );
+      const delayedClaim = await delayed.waitForMessage("held-before-append-file");
+      delayed.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(
+        path,
+        "b",
+        "pause-after-op,short-stale-lock",
+        "enable",
+        "unused",
+        "false",
+      );
+      await peer.waitForMessage("held-after-op");
+      peer.signal("SIGSTOP");
+
+      const mutation = spawnStoreChild(
+        path,
+        "b",
+        "pause-before-op,short-stale-lock",
+        "increment",
+      );
+      const prepared = await mutation.waitForMessage("held-before-op");
+      expect(prepared.operation?.baseRecords?.map((record) => record.id)).toEqual(["a", "b"]);
+      expect(prepared.operation?.baseRecords?.find((record) => record.id === "a")?.enabled).toBe(true);
+      expect(prepared.operation?.baseRecords?.find((record) => record.id === "b")?.enabled).toBe(false);
+      mutation.signal("SIGSTOP");
+
+      const delayedAppended = delayed.waitForMessage("held-after-op");
+      delayed.signal("SIGCONT");
+      delayed.stdin.write("resume\n");
+      await delayedAppended;
+      delayed.signal("SIGSTOP");
+
+      const liveEntries = (await journalLines(path)).map((line) => JSON.parse(line) as {
+        readonly seq?: number;
+        readonly operation?: { readonly id?: string };
+      });
+      const peerSeq = liveEntries.find((entry) => entry.operation?.id === "b")?.seq;
+      expect(delayedClaim.seq).toBeTypeOf("number");
+      expect(peerSeq).toBeTypeOf("number");
+      expect(peerSeq).not.toBe(delayedClaim.seq);
+
+      const mutationDone = mutation.waitForMessage("persisted");
+      mutation.signal("SIGCONT");
+      mutation.stdin.end("resume\n");
+      await expect(mutationDone).resolves.toMatchObject({ transformCalls: 2 });
+      await expect(mutation.onceExited).resolves.toBe(0);
+
+      const delayedDone = delayed.waitForMessage("persisted");
+      delayed.signal("SIGCONT");
+      delayed.stdin.end("resume\n");
+      await expect(delayedDone).resolves.toMatchObject({ type: "persisted" });
+      await expect(delayed.onceExited).resolves.toBe(0);
+
+      const peerDone = peer.waitForMessage("persisted");
+      peer.signal("SIGCONT");
+      peer.stdin.end("resume\n");
+      await expect(peerDone).resolves.toMatchObject({ type: "persisted" });
+      await expect(peer.onceExited).resolves.toBe(0);
+
+      const final = await new AccountStore({ path }).load();
+      expect(final.find((record) => record.id === "b")).toMatchObject({
+        enabled: false,
+        credits: { monthly: 1 },
+      });
+      if (action === "enable") expect(final.find((record) => record.id === "a")?.enabled).toBe(false);
+      if (action === "remove") expect(final.some((record) => record.id === "a")).toBe(false);
+      if (action === "add") expect(final.some((record) => record.id === "d")).toBe(true);
+
+      await new AccountStore({ path }).add(account("later"));
+      const afterLaterAdd = await new AccountStore({ path }).load();
+      if (action === "enable") {
+        expect(afterLaterAdd.find((record) => record.id === "a")?.enabled).toBe(false);
+      }
+      if (action === "remove") expect(afterLaterAdd.some((record) => record.id === "a")).toBe(false);
+      if (action === "add") expect(afterLaterAdd.some((record) => record.id === "d")).toBe(true);
       await expectNoTransientResidue(dir);
     },
     30_000,

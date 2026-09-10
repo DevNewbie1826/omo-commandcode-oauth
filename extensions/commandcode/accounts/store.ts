@@ -18,6 +18,7 @@ import {
   AccountStoreJournalWarning,
   parseAccountFile,
   parseAccountOperationDisposition,
+  parseAccountRecords,
   serializeAccountFile,
   type AccountOperationDisposition,
   type AccountOperationOutcome,
@@ -76,7 +77,19 @@ type StoreOperation =
       readonly kind: "state";
       readonly baseLastAppliedSeq: number;
       readonly records: readonly AccountRecord[];
-      readonly purpose?: "compact";
+      readonly purpose: "compact";
+    }
+  | {
+      readonly kind: "state";
+      readonly baseLastAppliedSeq: number;
+      /**
+       * Full state observed before the user transform. This duplicates one
+       * snapshot per user operation, but journal growth is already linear and
+       * the bounded size cost buys an exact OCC replay fence.
+       */
+      readonly baseRecords: readonly AccountRecord[];
+      readonly records: readonly AccountRecord[];
+      readonly purpose?: undefined;
     };
 
 type JournalEntry =
@@ -175,22 +188,21 @@ function parseOperation(value: unknown): StoreOperation {
     return { kind, id: requiredJournalString(value, "id"), retryAtMs };
   }
   if (kind === "state") {
-    const records = parseAccountFile({
-      version: ACCOUNTS_FILE_VERSION,
-      accounts: value["records"],
-    }).accounts;
+    const records = parseAccountRecords(value["records"]);
+    const baseLastAppliedSeq = parseNonNegativeSequence(
+      value["baseLastAppliedSeq"],
+      'journal field "baseLastAppliedSeq"',
+    );
     const purpose = value["purpose"];
-    if (purpose !== undefined && purpose !== "compact") {
+    if (purpose === "compact") return { kind, baseLastAppliedSeq, records, purpose };
+    if (purpose !== undefined) {
       throw new AccountStoreError('Expected journal field "purpose" to be "compact"');
     }
     return {
       kind,
-      baseLastAppliedSeq: parseNonNegativeSequence(
-        value["baseLastAppliedSeq"],
-        'journal field "baseLastAppliedSeq"',
-      ),
+      baseLastAppliedSeq,
+      baseRecords: parseAccountRecords(value["baseRecords"]),
       records,
-      ...(purpose === undefined ? {} : { purpose }),
     };
   }
   throw new AccountStoreError("Expected recognized journal operation kind");
@@ -286,13 +298,13 @@ function sameRecord(left: AccountRecord, right: AccountRecord): boolean {
 }
 
 function sameRecords(left: readonly AccountRecord[], right: readonly AccountRecord[]): boolean {
-  return (
-    left.length === right.length &&
-    left.every((record, index) => {
-      const candidate = right[index];
-      return candidate !== undefined && sameRecord(record, candidate);
-    })
-  );
+  if (left.length !== right.length) return false;
+  const leftById = [...left].sort((first, second) => first.id.localeCompare(second.id));
+  const rightById = [...right].sort((first, second) => first.id.localeCompare(second.id));
+  return leftById.every((record, index) => {
+    const candidate = rightById[index];
+    return candidate !== undefined && sameRecord(record, candidate);
+  });
 }
 
 function describeStateEffect(
@@ -509,14 +521,14 @@ export class AccountStore {
         effect = describeStateEffect(records, intended);
         return sameRecords(records, intended)
           ? null
-          : { kind: "state", records: intended, baseLastAppliedSeq };
+          : { kind: "state", baseRecords: records, records: intended, baseLastAppliedSeq };
       },
       (records) => stateEffectPresent(records, effect),
       (records, baseLastAppliedSeq) => {
         const repaired = repairStateEffect(records, effect);
         return sameRecords(records, repaired)
           ? null
-          : { kind: "state", records: repaired, baseLastAppliedSeq };
+          : { kind: "state", baseRecords: records, records: repaired, baseLastAppliedSeq };
       },
       (records) => anyStateEffectPresent(records, effect),
     );
@@ -703,18 +715,18 @@ export class AccountStore {
       const operation = entry.operation;
       let outcome: AccountOperationOutcome;
       if (operation.kind === "state") {
-        // An internal compact is only a snapshot of the replay prefix its
-        // preparer observed. Never let it replace effects that arrived after
-        // that prefix, including field changes and removals. Structural
-        // equality is the defensive prefix-identity check: with sequence-
-        // ordered entries, `current` is exactly the pre-replay state plus all
-        // state-changing operations at or below the compact's declared base.
-        const compactMatchesReplayBase = operation.purpose !== "compact" ||
-          (
-            perReplayHighestApplied <= operation.baseLastAppliedSeq &&
-            sameRecords(current, operation.records)
-          );
-        if (compactMatchesReplayBase && perReplayHighestApplied <= operation.baseLastAppliedSeq) {
+        // A state replacement is valid only for the exact replay state its
+        // preparer observed. For internal compacts the result is also the
+        // base; user operations persist their distinct pre-transform base.
+        // The sequence bound retains the compact prefix rule while structural
+        // equality catches delayed lower-sequence operations hidden at prepare.
+        const replayBase = operation.purpose === "compact"
+          ? operation.records
+          : operation.baseRecords;
+        if (
+          perReplayHighestApplied <= operation.baseLastAppliedSeq &&
+          sameRecords(current, replayBase)
+        ) {
           current = operation.records;
           outcome = "applied";
         } else {

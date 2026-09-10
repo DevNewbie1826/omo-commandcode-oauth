@@ -259,6 +259,11 @@ function parseAccountRecord(value: unknown, index: number): AccountRecord {
   };
 }
 
+/** Validate an untrusted array with the same rules as an accounts version file. */
+export function parseAccountRecords(value: unknown): readonly AccountRecord[] {
+  return parseAccountFile({ version: ACCOUNTS_FILE_VERSION, accounts: value }).accounts;
+}
+
 /**
  * Parse untrusted JSON into a validated `AccountFile`. Duplicate ids and
  * duplicate tokens are rejected so the pool can treat `id` and `token` as

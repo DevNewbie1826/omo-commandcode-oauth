@@ -107,7 +107,7 @@ class ScheduledStore extends AccountStore {
   async appendJournal(entry) {
     if (modes.has("pause-before-op") && entry.type === "op" && !this.heldJournal) {
       this.heldJournal = true;
-      await this.pause("held-before-op");
+      await this.pause("held-before-op", { operation: entry.operation });
     }
     if (
       modes.has("pause-before-state") &&
