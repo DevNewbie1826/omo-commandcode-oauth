@@ -3,11 +3,14 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ChildProcess } from "node:child_process";
 import type { Interface as ReadlineInterface } from "node:readline";
 import { createInterface } from "node:readline";
 import { afterEach, describe, expect, test } from "vitest";
-import { AccountStoreError, parseAccountFile } from "../extensions/commandcode/accounts/schema.js";
+import {
+  AccountStoreError,
+  AccountStoreJournalWarning,
+  parseAccountFile,
+} from "../extensions/commandcode/accounts/schema.js";
 import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 import type { AccountRecordInput } from "../extensions/commandcode/accounts/schema.js";
 
@@ -186,8 +189,8 @@ describe("cross-process optimistic concurrency", () => {
 
       const ids = await persistedIds(path);
       expect([...ids].sort()).toEqual(["a", "b"]);
-      // No lock-file machinery, no abandoned temp files: the mutation cycle
-      // leaves exactly the accounts file behind.
+      // No lock-file machinery or abandoned temp files; the fully
+      // garbage-collected journal has also been removed.
       await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
     },
     30_000,
@@ -259,6 +262,82 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
+    "Given writer A pauses after final identity verification, When B commits before A renames, Then journal reconciliation restores BOTH accounts",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+
+      const first = spawnStoreChild(path, "a", "pause-after-verify");
+      await first.waitForMessage("held-after-verify");
+      expect((await stat(`${path}.journal`)).mode & 0o777).toBe(0o600);
+      const second = spawnStoreChild(path, "b");
+      await expect(second.onceExited).resolves.toBe(0);
+
+      first.stdin.end("resume\n");
+      await expect(first.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given A publishes while B holds a verified stale identity, When C commits before B resumes, Then reconciliation preserves a, b, AND c",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+
+      const first = spawnStoreChild(path, "a", "pause-after-write");
+      await first.waitForMessage("held-after-write");
+      const second = spawnStoreChild(path, "b", "pause-after-verify");
+      await second.waitForMessage("held-after-verify");
+
+      first.stdin.end("resume\n");
+      await expect(first.onceExited).resolves.toBe(0);
+      const third = spawnStoreChild(path, "c");
+      await expect(third.onceExited).resolves.toBe(0);
+
+      second.stdin.end("resume\n");
+      await expect(second.onceExited).resolves.toBe(0);
+      const ids = await persistedIds(path);
+      expect([...ids].sort()).toEqual(["a", "b", "c"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given sequential operations fully reconcile, When the mutation returns, Then journal GC leaves an empty protected journal",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+      const store = new AccountStore({ path });
+
+      await store.add(account("a"));
+      await store.setEnabled("a", false);
+      await store.remove("a");
+
+      await expect(stat(`${path}.journal`)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  test(
+    "Given a journal ends with a torn garbage line, When load reconciles it, Then load succeeds and reports a typed warning",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+      const warnings: AccountStoreJournalWarning[] = [];
+      const store = new AccountStore({ path, onWarning: (warning) => warnings.push(warning) });
+      await store.add(account("a"));
+      await writeFile(`${path}.journal`, '{"type":"op"', { encoding: "utf-8", flag: "a" });
+
+      const records = await store.load();
+
+      expect(records.map((record) => record.id)).toEqual(["a"]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toBeInstanceOf(AccountStoreJournalWarning);
+    },
+  );
+
+  test(
     "Given every optimistic-concurrency verification is forced to fail, When a writer exhausts its bounded attempts, Then it fails with a typed concurrent-modification error and leaves no temp or lock residue",
     async () => {
       const dir = await tempDir();
@@ -270,8 +349,8 @@ describe("cross-process optimistic concurrency", () => {
       expect(failure.message).toMatch(/concurrent/i);
       await expect(child.onceExited).resolves.toBe(1);
 
-      // No successful write ever landed and every attempt cleaned up: the
-      // directory holds neither the accounts file nor temp/lock residue.
+      // No successful account write landed and every attempt cleaned up; the
+      // aborted operation and its journal were fully GC'd.
       await expect(readdir(dir)).resolves.toEqual([]);
     },
     30_000,
