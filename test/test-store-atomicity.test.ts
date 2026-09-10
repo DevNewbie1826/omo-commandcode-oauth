@@ -37,6 +37,7 @@ interface ChildMessage {
   readonly ids?: readonly string[];
   readonly name?: string;
   readonly message?: string;
+  readonly operation?: { readonly baseLastAppliedSeq?: number };
 }
 
 function caughtOf(fn: () => unknown): unknown {
@@ -103,6 +104,7 @@ describe("cross-process optimistic concurrency", () => {
   interface ManagedChild {
     readonly stdin: NodeJS.WritableStream;
     readonly onceExited: Promise<number>;
+    kill(): void;
     waitForMessage(type: string): Promise<ChildMessage>;
   }
 
@@ -120,7 +122,8 @@ describe("cross-process optimistic concurrency", () => {
         let parsed: unknown;
         try {
           parsed = JSON.parse(line);
-        } catch {
+        } catch (error) {
+          void error;
           return; // not a protocol line; keep waiting
         }
         if (!isChildMessage(parsed) || parsed.type !== type) return;
@@ -172,7 +175,14 @@ describe("cross-process optimistic concurrency", () => {
       });
     });
     const reader = createInterface({ input: stdout });
-    return { stdin, onceExited, waitForMessage: (type) => waitForMessage(reader, type) };
+    return {
+      stdin,
+      onceExited,
+      kill: () => {
+        child.kill("SIGKILL");
+      },
+      waitForMessage: (type) => waitForMessage(reader, type),
+    };
   }
 
   async function persistedIds(accountsPath: string): Promise<string[]> {
@@ -415,6 +425,140 @@ describe("cross-process optimistic concurrency", () => {
       expect(failure.message).toBe("Account credential already exists");
       await expect(first.onceExited).resolves.toBe(1);
       await expect(persistedIds(path)).resolves.toEqual(["b"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a loader is paused before appending a stale compact while GC empties the journal, When that compact is appended later, Then its reset sequence cannot replay over newer data",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "watermark.json");
+      await new AccountStore({ path }).add(account("seed"));
+
+      const pending = spawnStoreChild(path, "p", "pause-after-op");
+      await pending.waitForMessage("held-after-op");
+      const loader = spawnStoreChild(
+        path,
+        "loader",
+        "pause-before-state,pause-after-state",
+        "load",
+      );
+      const stale = await loader.waitForMessage("held-before-state");
+      expect(stale.operation?.baseLastAppliedSeq).toBeGreaterThan(1);
+
+      pending.stdin.end("resume\n");
+      await expect(pending.onceExited).resolves.toBe(0);
+      const peer = spawnStoreChild(path, "b");
+      await expect(peer.onceExited).resolves.toBe(0);
+      await expect(stat(`${path}.journal`)).rejects.toMatchObject({ code: "ENOENT" });
+
+      loader.stdin.write("resume\n");
+      await loader.waitForMessage("held-after-state");
+      await expect(persistedIds(path)).resolves.toEqual(["seed", "p", "b"]);
+      loader.stdin.end("resume\n");
+      await expect(loader.onceExited).resolves.toBe(0);
+      expect([...(await persistedIds(path))].sort()).toEqual(["b", "p", "seed"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a state mutation is skipped as older than a peer compact, When publication reconciles, Then the mutation retries until its keyName effect is present",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "state-effect.json");
+      await new AccountStore({ path }).add(account("a"));
+
+      const mutation = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-op",
+        "state",
+        "token-a",
+        "requested",
+      );
+      await mutation.waitForMessage("held-before-op");
+      const peer = spawnStoreChild(path, "b", "pause-after-op");
+      await peer.waitForMessage("held-after-op");
+
+      mutation.stdin.end("resume\n");
+      await expect(mutation.onceExited).resolves.toBe(0);
+      peer.stdin.end("resume\n");
+      await expect(peer.onceExited).resolves.toBe(0);
+      const records = await new AccountStore({ path }).load();
+      expect(records.find((record) => record.id === "a")?.keyName).toBe("requested");
+    },
+    30_000,
+  );
+
+  test(
+    "Given racers add the same id and token with different keyName fields, When both publish, Then exactly one succeeds and the other rejects the credential mismatch",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "same-credential.json");
+      const first = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-op",
+        "add",
+        "shared",
+        "first",
+      );
+      await first.waitForMessage("held-before-op");
+      const second = spawnStoreChild(path, "a", "normal", "add", "shared", "second");
+      await expect(second.onceExited).resolves.toBe(0);
+
+      first.stdin.end("resume\n");
+      const failure = await first.waitForMessage("error");
+      expect(failure).toMatchObject({
+        name: "AccountStoreError",
+        message: "Account credential already exists",
+      });
+      await expect(first.onceExited).resolves.toBe(1);
+      await expect(new AccountStore({ path }).load()).resolves.toMatchObject([
+        { id: "a", token: "shared", keyName: "second" },
+      ]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a child is killed while owning the journal lock, When a fresh writer steals the stale lock, Then it succeeds without losing its append",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "dead-lock.json");
+      const owner = spawnStoreChild(path, "owner", "pause-with-lock");
+      await owner.waitForMessage("held-with-lock");
+      owner.kill();
+      await expect(owner.onceExited).rejects.toThrow(/SIGKILL/);
+
+      const writer = spawnStoreChild(path, "survivor", "steal-lock-now");
+      await expect(writer.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["survivor"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a settled journal prefix is followed by an abandoned operation, When GC runs, Then it collects the prefix without deleting the later pending append",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "prefix-gc.json");
+      const collector = spawnStoreChild(path, "settled", "pause-before-gc");
+      await collector.waitForMessage("held-before-gc");
+      const abandoned = spawnStoreChild(path, "pending", "pause-after-op");
+      await abandoned.waitForMessage("held-after-op");
+      abandoned.kill();
+      await expect(abandoned.onceExited).rejects.toThrow(/SIGKILL/);
+
+      collector.stdin.end("resume\n");
+      await expect(collector.onceExited).resolves.toBe(0);
+      const retained = (await readFile(`${path}.journal`, "utf-8"))
+        .split("\n")
+        .filter((line) => line.length > 0);
+      expect(retained).toHaveLength(1);
+      await expect(persistedIds(path)).resolves.toEqual(["settled", "pending"]);
     },
     30_000,
   );

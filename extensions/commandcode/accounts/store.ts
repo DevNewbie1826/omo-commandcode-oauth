@@ -32,6 +32,8 @@ export interface AccountStoreOptions {
   readonly path: string;
   readonly now?: () => number;
   readonly onWarning?: (warning: AccountStoreJournalWarning) => void;
+  /** Override only for deterministic stale-lock recovery tests. */
+  readonly journalLockStaleMs?: number;
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {
@@ -43,7 +45,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const MAX_WRITE_ATTEMPTS = 8;
+const MAX_MUTATION_ATTEMPTS = 4;
+const DEFAULT_JOURNAL_LOCK_STALE_MS = 15_000;
 const MAX_JOURNAL_LOCK_ATTEMPTS = 10_000;
+const JOURNAL_LOCK_RETRY_MS = 2;
 
 type FileIdentity =
   | { readonly kind: "missing" }
@@ -232,40 +237,61 @@ export class AccountStore {
       },
       (records) => {
         const matchingId = records.find((candidate) => candidate.id === record.id);
-        if (matchingId?.token === record.token) return;
-        if (records.some((candidate) => candidate.token === record.token)) {
+        if (matchingId === undefined) {
+          if (records.some((candidate) => candidate.token === record.token)) {
+            throw new AccountStoreError("Account credential already exists");
+          }
+          return false;
+        }
+        if (matchingId.token !== record.token) {
+          throw new AccountStoreError(`Account id already exists: ${record.id}`);
+        }
+        if (!this.sameAddIntent(matchingId, record)) {
           throw new AccountStoreError("Account credential already exists");
         }
-        throw new AccountStoreError(`Account id already exists: ${record.id}`);
+        return true;
       },
     );
   }
 
   async remove(id: string): Promise<void> {
-    await this.update((records) => {
-      if (!records.some((record) => record.id === id)) {
-        throw new AccountStoreError(`Unknown account id: ${id}`);
-      }
-      return { kind: "remove", id };
-    });
+    await this.update(
+      (records) => {
+        if (!records.some((record) => record.id === id)) {
+          throw new AccountStoreError(`Unknown account id: ${id}`);
+        }
+        return { kind: "remove", id };
+      },
+      (records) => !records.some((record) => record.id === id),
+    );
   }
 
   async setEnabled(id: string, enabled: boolean): Promise<void> {
-    await this.update((records) => {
-      const record = records.find((candidate) => candidate.id === id);
-      if (record === undefined) throw new AccountStoreError(`Unknown account id: ${id}`);
-      return record.enabled === enabled ? null : { kind: "enable", id, enabled };
-    });
+    await this.update(
+      (records) => {
+        const record = records.find((candidate) => candidate.id === id);
+        if (record === undefined) throw new AccountStoreError(`Unknown account id: ${id}`);
+        return record.enabled === enabled ? null : { kind: "enable", id, enabled };
+      },
+      (records) => records.find((record) => record.id === id)?.enabled === enabled,
+    );
   }
 
   async mutate(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
-    await this.update((records, baseLastAppliedSeq) => {
-      const next = transform(records);
-      serializeAccountFile(next);
-      return this.narrowMutation(records, next, baseLastAppliedSeq);
-    });
+    await this.update(
+      (records, baseLastAppliedSeq) => {
+        const next = transform(records);
+        serializeAccountFile(next);
+        return this.narrowMutation(records, next, baseLastAppliedSeq);
+      },
+      (records) => {
+        const intended = transform(records);
+        serializeAccountFile(intended);
+        return sameRecords(records, intended);
+      },
+    );
   }
 
   private async update(
@@ -273,12 +299,15 @@ export class AccountStore {
       records: readonly AccountRecord[],
       baseLastAppliedSeq: number,
     ) => StoreOperation | null,
-    verify?: (records: readonly AccountRecord[]) => void,
+    effectPresent: (records: readonly AccountRecord[]) => boolean,
   ): Promise<void> {
     await this.exclusive(() =>
       exclusiveAcrossInstances(async () => {
-        const records = await this.persistOperation(createOperation);
-        if (verify !== undefined) verify(records);
+        for (let attempt = 1; attempt <= MAX_MUTATION_ATTEMPTS; attempt += 1) {
+          const records = await this.persistOperation(createOperation);
+          if (effectPresent(records)) return;
+        }
+        throw new AccountStoreError("concurrent modification");
       }),
     );
   }
@@ -453,41 +482,54 @@ export class AccountStore {
       const disk = await this.readDiskSnapshotDirect();
       const journal = await this.readJournal();
       if (journal.entries.length === 0) return;
-      const settled = new Set(
-        journal.entries
-          .filter((entry) => entry.type === "commit" || entry.type === "abort")
-          .map((entry) => entry.id),
+      const committed = new Set(
+        journal.entries.flatMap((entry) => entry.type === "commit" ? [entry.id] : []),
       );
-      const operations = journal.entries.filter((entry) => entry.type === "op");
-      const allAborted = operations.every((entry) =>
-        journal.entries.some((marker) => marker.type === "abort" && marker.id === entry.id),
+      const aborted = new Set(
+        journal.entries.flatMap((entry) => entry.type === "abort" ? [entry.id] : []),
       );
-      const safeThroughState = operations.every(
-        (entry) =>
-          entry.seq !== undefined &&
-          entry.seq <= disk.lastAppliedSeq &&
-          settled.has(entry.id),
-      );
-      if (!allAborted && !safeThroughState) return;
-      const temporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
+      const collectableIds = new Set<string>();
+      for (const entry of journal.entries) {
+        if (entry.type !== "op" || entry.seq === undefined) continue;
+        const publishedCommit =
+          committed.has(entry.id) && entry.seq <= disk.lastAppliedSeq;
+        if (!publishedCommit && !aborted.has(entry.id)) break;
+        collectableIds.add(entry.id);
+      }
+      const retained = journal.entries.filter((entry) => !collectableIds.has(entry.id));
+      if (collectableIds.size === 0) return;
+      const accountTemporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
+      const journalTemporaryPath = `${this.journalPath()}.${process.pid}.${randomUUID()}.tmp`;
       try {
-        if (disk.exists && disk.lastAppliedSeq > 0) {
-          await writeFile(temporaryPath, serializeAccountFile(disk.records), {
+        if (disk.exists) {
+          await writeFile(
+            accountTemporaryPath,
+            serializeAccountFile(disk.records, disk.lastAppliedSeq),
+            { encoding: "utf-8", flag: "wx", mode: 0o600 },
+          );
+          await rename(accountTemporaryPath, this.options.path);
+        }
+        if (retained.length === 0) {
+          await rm(this.journalPath(), { force: true });
+        } else {
+          const contents = `${retained.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+          await writeFile(journalTemporaryPath, contents, {
             encoding: "utf-8",
             flag: "wx",
             mode: 0o600,
           });
-          await rename(temporaryPath, this.options.path);
+          await rename(journalTemporaryPath, this.journalPath());
         }
-        await rm(this.journalPath(), { force: true });
       } catch (error) {
-        await this.removeTemporary(temporaryPath, error);
+        await this.removeTemporary(accountTemporaryPath, error);
+        await this.removeTemporary(journalTemporaryPath, error);
         throw new AccountStoreError(
           `Could not garbage-collect accounts journal at ${this.journalPath()}`,
           { cause: error },
         );
       }
-      await this.removeTemporary(temporaryPath);
+      await this.removeTemporary(accountTemporaryPath);
+      await this.removeTemporary(journalTemporaryPath);
     });
   }
 
@@ -590,7 +632,7 @@ export class AccountStore {
     return `${this.journalPath()}.lock`;
   }
 
-  private async withJournalLock<T>(task: () => Promise<T>): Promise<T> {
+  protected async withJournalLock<T>(task: () => Promise<T>): Promise<T> {
     await mkdir(dirname(this.options.path), { recursive: true });
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     for (let attempt = 1; attempt <= MAX_JOURNAL_LOCK_ATTEMPTS; attempt += 1) {
@@ -603,12 +645,15 @@ export class AccountStore {
             cause: error,
           });
         }
+        await this.stealJournalLockIfStale();
         await new Promise<void>((resolve) => setImmediate(resolve));
+        await new Promise<void>((resolve) => setTimeout(resolve, JOURNAL_LOCK_RETRY_MS));
       }
     }
     if (handle === undefined) {
       throw new AccountStoreError(`Timed out locking accounts journal at ${this.journalPath()}`);
     }
+    const ownedLock = await handle.stat();
     try {
       return await task();
     } finally {
@@ -618,21 +663,53 @@ export class AccountStore {
       } catch (error) {
         closeError = error;
       }
+      let cleanupError: unknown;
       try {
-        await rm(this.journalLockPath(), { force: true });
+        const currentLock = await stat(this.journalLockPath());
+        if (currentLock.ino === ownedLock.ino && currentLock.dev === ownedLock.dev) {
+          await rm(this.journalLockPath());
+        }
       } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) cleanupError = error;
+      }
+      if (closeError !== undefined || cleanupError !== undefined) {
         const cause = closeError === undefined
-          ? error
-          : new AggregateError([closeError, error], "lock close and cleanup both failed");
+          ? cleanupError
+          : cleanupError === undefined
+            ? closeError
+            : new AggregateError([closeError, cleanupError], "lock close and cleanup both failed");
         throw new AccountStoreError(`Could not release accounts journal lock at ${this.journalPath()}`, {
           cause,
         });
       }
-      if (closeError !== undefined) {
-        throw new AccountStoreError(`Could not close accounts journal lock at ${this.journalPath()}`, {
-          cause: closeError,
-        });
-      }
+    }
+  }
+
+  private async stealJournalLockIfStale(): Promise<void> {
+    const staleMs = this.options.journalLockStaleMs ?? DEFAULT_JOURNAL_LOCK_STALE_MS;
+    let lockStats: Awaited<ReturnType<typeof stat>>;
+    try {
+      lockStats = await stat(this.journalLockPath());
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return;
+      throw new AccountStoreError(`Could not inspect accounts journal lock at ${this.journalPath()}`, {
+        cause: error,
+      });
+    }
+    if (Date.now() - lockStats.mtimeMs < staleMs) return;
+    const tombstone = `${this.journalLockPath()}.${process.pid}.${randomUUID()}.stale`;
+    try {
+      // An owner misclassified as dead can only overlap a line-framed atomic
+      // append or another GC. Prefix GC is safe from lock ownership itself:
+      // the account-file watermark is preserved, so an older compact cannot
+      // become current again even if that owner resumes after the steal.
+      await rename(this.journalLockPath(), tombstone);
+      await rm(tombstone);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return;
+      throw new AccountStoreError(`Could not recover stale accounts journal lock at ${this.journalPath()}`, {
+        cause: error,
+      });
     }
   }
 
@@ -703,6 +780,18 @@ export class AccountStore {
   private normalize(input: AccountRecordInput): AccountRecord {
     const createdAt = input.createdAt ?? new Date(this.clock()).toISOString();
     return { ...input, enabled: input.enabled ?? true, createdAt };
+  }
+
+  private sameAddIntent(candidate: AccountRecord, intended: AccountRecord): boolean {
+    return (
+      candidate.id === intended.id &&
+      candidate.token === intended.token &&
+      candidate.userId === intended.userId &&
+      candidate.userName === intended.userName &&
+      candidate.keyName === intended.keyName &&
+      candidate.enabled === intended.enabled &&
+      JSON.stringify(candidate.credits) === JSON.stringify(intended.credits)
+    );
   }
 
   private exclusive<T>(task: () => Promise<T>): Promise<T> {
