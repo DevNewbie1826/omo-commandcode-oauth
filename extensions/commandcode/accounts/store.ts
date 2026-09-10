@@ -109,6 +109,7 @@ interface VersionSnapshot extends DiskSnapshot {
   readonly name: string;
   readonly path: string;
   readonly publicationSeq: number;
+  readonly dispositions: readonly Omit<AccountOperationDisposition, "version">[];
 }
 
 type MutationDisposition = AccountOperationOutcome | "complete" | "never-applied";
@@ -722,6 +723,7 @@ export class AccountStore {
     for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
       const identity = await this.captureIdentity();
       const disk = await this.readDiskSnapshot();
+      await this.backfillRetainedVersionDispositions();
       const journal = await this.readJournal();
       const replayed = this.replay(disk.records, journal.entries, disk.lastAppliedSeq);
       const maximumSeq = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
@@ -778,6 +780,7 @@ export class AccountStore {
 
   protected async replaceJournalWithEmpty(): Promise<void> {
     for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+      await this.backfillRetainedVersionDispositions();
       const collected = await this.withJournalLock(async () => {
         const journal = await this.readJournal();
         if (journal.liveContents.length > 0) {
@@ -862,6 +865,13 @@ export class AccountStore {
       // authority has absorbed their complete sequence range.
       const authority = await this.readAuthoritativeVersionSnapshot();
       if (authority === undefined || archiveMaximum > authority.publicationSeq) continue;
+      const aborted = new Set(
+        entries.filter((entry) => entry.type === "abort").map((entry) => entry.id),
+      );
+      const settled = new Set((await this.readDispositions()).map((entry) => entry.opId));
+      if (entries.some((entry) =>
+        entry.type === "op" && !aborted.has(entry.id) && !settled.has(entry.opId)
+      )) continue;
       try {
         await rm(archivePath);
       } catch (error) {
@@ -880,6 +890,9 @@ export class AccountStore {
     const floor = Math.max(0, authority.publicationSeq - VERSION_RETENTION_DISTANCE);
     for (const candidate of await this.versionCandidates()) {
       if (candidate.publicationSeq >= floor) continue;
+      const embedded = await this.readVersionDispositions(candidate);
+      const settled = new Set((await this.readDispositions()).map((entry) => entry.opId));
+      if (embedded.some((entry) => !settled.has(entry.opId))) continue;
       try {
         await rm(candidate.path);
       } catch (error) {
@@ -944,10 +957,63 @@ export class AccountStore {
   private async operationDisposition(
     opId: string,
   ): Promise<AccountOperationDisposition | undefined> {
-    const dispositions = await this.readDispositions();
+    const embedded = await this.retainedVersionDispositions();
+    await this.backfillDispositions(embedded);
+    const dispositions = [...await this.readDispositions(), ...embedded];
     return dispositions
       .filter((disposition) => disposition.opId === opId)
       .sort((left, right) => right.version - left.version)[0];
+  }
+
+  private async readVersionDispositions(candidate: {
+    readonly path: string;
+    readonly publicationSeq: number;
+  }): Promise<readonly AccountOperationDisposition[]> {
+    let contents: string;
+    try {
+      contents = await readFile(candidate.path, "utf-8");
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw new AccountStoreError(`Could not read accounts version at ${candidate.path}`, {
+        cause: error,
+      });
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents);
+    } catch (error) {
+      throw new AccountStoreError(`Accounts version at ${candidate.path} is not valid JSON`, {
+        cause: error,
+      });
+    }
+    return (parseAccountFile(parsed).dispositions ?? []).map((entry) => ({
+      ...entry,
+      version: candidate.publicationSeq,
+    }));
+  }
+
+  private async retainedVersionDispositions(): Promise<readonly AccountOperationDisposition[]> {
+    const dispositions: AccountOperationDisposition[] = [];
+    for (const candidate of await this.versionCandidates()) {
+      dispositions.push(...await this.readVersionDispositions(candidate));
+    }
+    return dispositions;
+  }
+
+  private async backfillDispositions(
+    dispositions: readonly AccountOperationDisposition[],
+  ): Promise<void> {
+    const byVersion = new Map<number, Omit<AccountOperationDisposition, "version">[]>();
+    for (const { version, ...draft } of dispositions) {
+      const drafts = byVersion.get(version) ?? [];
+      drafts.push(draft);
+      byVersion.set(version, drafts);
+    }
+    for (const [version, drafts] of byVersion) await this.appendDispositions(drafts, version);
+  }
+
+  private async backfillRetainedVersionDispositions(): Promise<void> {
+    await this.backfillDispositions(await this.retainedVersionDispositions());
   }
 
   private async readDispositions(): Promise<readonly AccountOperationDisposition[]> {
@@ -1233,11 +1299,16 @@ export class AccountStore {
       throw new AccountStoreError("Accounts publication is missing its journal sequence");
     }
 
+    const publicationContents = serializeAccountFile(
+      publication.accounts,
+      publicationSeq,
+      dispositions,
+    );
     const temporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
     let versionPath = this.versionPath(publicationSeq);
     try {
       await mkdir(dirname(this.options.path), { recursive: true });
-      await writeFile(temporaryPath, contents, {
+      await writeFile(temporaryPath, publicationContents, {
         encoding: "utf-8",
         flag: "wx",
         mode: 0o600,
@@ -1263,14 +1334,13 @@ export class AccountStore {
     const authority = await this.readAuthoritativeVersionSnapshot();
     const won = authority?.name === basename(versionPath);
     if (won) {
-      // Record replay outcomes immediately after the immutable version link.
-      // A crash before this point leaves journal bytes for the next publisher;
-      // after this point the durable opId receipt is authoritative.
+      // The immutable link atomically commits state and outcomes. The sidecar
+      // is a rebuildable cache used to prove recovery evidence before GC.
       await this.appendDispositions(dispositions, publicationSeq);
       // Convenience mirror only. A racing, torn, failed, or regressive mirror
       // is harmless because a store that observes versions never falls back to it.
       try {
-        await writeFile(this.options.path, contents, { encoding: "utf-8", mode: 0o600 });
+        await writeFile(this.options.path, publicationContents, { encoding: "utf-8", mode: 0o600 });
       } catch (error) {
         this.warn(new AccountStoreJournalWarning(
           `Could not update convenience accounts snapshot at ${this.options.path}`,
@@ -1405,6 +1475,7 @@ export class AccountStore {
           publicationSeq: candidate.publicationSeq,
           records: file.accounts,
           lastAppliedSeq: file.lastAppliedSeq ?? 0,
+          dispositions: file.dispositions ?? [],
           exists: true,
         };
         if (

@@ -283,6 +283,7 @@ describe("account store", () => {
         { id: "a", token: "token-a", enabled: true, createdAt: new Date(BASE).toISOString() },
       ],
       lastAppliedSeq: expect.any(Number),
+      dispositions: expect.any(Array),
     });
   });
 
@@ -340,6 +341,7 @@ describe("account store", () => {
       version: 1,
       accounts: [{ id: "a", token: "token-a", enabled: true, createdAt: new Date(BASE).toISOString() }],
       lastAppliedSeq: expect.any(Number),
+      dispositions: expect.any(Array),
     });
   });
 

@@ -723,6 +723,53 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test.each(["killed", "live-delayed"] as const)(
+    "Given an operation is absorbed by a %s settler paused after linking, When another loader collects recovery bytes and the owner resumes, Then embedded outcomes prevent a second transform",
+    async (settlerState) => {
+      const dir = await tempDir();
+      const path = join(dir, `${settlerState}-atomic-disposition.json`);
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+
+      const owner = spawnStoreChild(path, "a", "pause-after-op", "increment");
+      await owner.waitForMessage("held-after-op");
+      owner.signal("SIGSTOP");
+
+      const settler = spawnStoreChild(path, "loader", "pause-before-mirror", "load");
+      await settler.waitForMessage("held-before-mirror");
+      if (settlerState === "killed") {
+        const killed = settler.onceExited;
+        settler.kill();
+        await expect(killed).rejects.toThrow(/SIGKILL/);
+      } else {
+        settler.signal("SIGSTOP");
+      }
+
+      await expect(spawnStoreChild(path, "collector", "normal", "load").onceExited).resolves.toBe(0);
+
+      const persisted = owner.waitForMessage("persisted");
+      owner.signal("SIGCONT");
+      owner.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(owner.onceExited).resolves.toBe(0);
+
+      if (settlerState === "live-delayed") {
+        const settled = settler.waitForMessage("persisted");
+        settler.signal("SIGCONT");
+        settler.stdin.end("resume\n");
+        await expect(settled).resolves.toMatchObject({ transformCalls: 0 });
+        await expect(settler.onceExited).resolves.toBe(0);
+      }
+
+      const [record] = await new AccountStore({ path }).load();
+      expect(record?.credits?.monthly).toBe(1);
+    },
+    30_000,
+  );
+
   test(
     "Given a loader is paused before appending a stale compact while GC empties the journal, When that compact is appended later, Then its reset sequence cannot replay over newer data",
     async () => {

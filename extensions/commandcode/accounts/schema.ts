@@ -16,10 +16,13 @@ export type AccountOperationOutcome =
   | "ignored-missing";
 
 /** Durable evidence that one journal operation was settled by a publication. */
-export interface AccountOperationDisposition {
+export interface AccountFileDisposition {
   readonly opId: string;
   readonly outcome: AccountOperationOutcome;
   readonly seq: number;
+}
+
+export interface AccountOperationDisposition extends AccountFileDisposition {
   /** Sequence of the immutable accounts version that settled the operation. */
   readonly version: number;
 }
@@ -73,6 +76,8 @@ export interface AccountFile {
   readonly accounts: readonly AccountRecord[];
   /** Highest journal sequence incorporated by this state snapshot. */
   readonly lastAppliedSeq?: number;
+  /** Outcomes atomically committed by this immutable publication. */
+  readonly dispositions?: readonly AccountFileDisposition[];
 }
 
 /** Domain error for every accounts-file failure: parse, IO, or invariant. */
@@ -136,7 +141,7 @@ function requiredNonNegativeSafeInteger(
 }
 
 /** Validate one untrusted line from the append-only operation disposition log. */
-export function parseAccountOperationDisposition(value: unknown): AccountOperationDisposition {
+function parseAccountFileDisposition(value: unknown): AccountFileDisposition {
   if (!isRecord(value)) {
     throw new AccountStoreError("Expected account operation disposition to be an object");
   }
@@ -153,6 +158,16 @@ export function parseAccountOperationDisposition(value: unknown): AccountOperati
     opId: requiredString(value, "opId", "account operation disposition"),
     outcome,
     seq: requiredNonNegativeSafeInteger(value, "seq", "account operation disposition"),
+  };
+}
+
+/** Validate one untrusted line from the append-only operation disposition log. */
+export function parseAccountOperationDisposition(value: unknown): AccountOperationDisposition {
+  if (!isRecord(value)) {
+    throw new AccountStoreError("Expected account operation disposition to be an object");
+  }
+  return {
+    ...parseAccountFileDisposition(value),
     version: requiredNonNegativeSafeInteger(value, "version", "account operation disposition"),
   };
 }
@@ -290,9 +305,18 @@ export function parseAccountFile(value: unknown): AccountFile {
     );
   }
 
-  return lastAppliedSeqValue === undefined
-    ? { version: ACCOUNTS_FILE_VERSION, accounts }
-    : { version: ACCOUNTS_FILE_VERSION, accounts, lastAppliedSeq: lastAppliedSeqValue };
+  const dispositionsValue = value["dispositions"];
+  if (dispositionsValue !== undefined && !Array.isArray(dispositionsValue)) {
+    throw new AccountStoreError('Expected accounts file field "dispositions" to be an array');
+  }
+  const dispositions = dispositionsValue?.map(parseAccountFileDisposition);
+
+  return {
+    version: ACCOUNTS_FILE_VERSION,
+    accounts,
+    ...(lastAppliedSeqValue === undefined ? {} : { lastAppliedSeq: lastAppliedSeqValue }),
+    ...(dispositions === undefined ? {} : { dispositions }),
+  };
 }
 
 function assertWritableEpochMs(value: number, field: string): void {
@@ -313,6 +337,7 @@ function assertWritableEpochMs(value: number, field: string): void {
 export function serializeAccountFile(
   accounts: readonly AccountRecord[],
   lastAppliedSeq?: number,
+  dispositions?: readonly AccountFileDisposition[],
 ): string {
   for (const account of accounts) {
     if (account.retryAt !== undefined) {
@@ -333,9 +358,11 @@ export function serializeAccountFile(
       "Refusing to persist lastAppliedSeq: expected a non-negative safe integer",
     );
   }
-  const file: AccountFile =
-    lastAppliedSeq === undefined
-      ? { version: ACCOUNTS_FILE_VERSION, accounts }
-      : { version: ACCOUNTS_FILE_VERSION, accounts, lastAppliedSeq };
+  const file: AccountFile = {
+    version: ACCOUNTS_FILE_VERSION,
+    accounts,
+    ...(lastAppliedSeq === undefined ? {} : { lastAppliedSeq }),
+    ...(dispositions === undefined ? {} : { dispositions }),
+  };
   return `${JSON.stringify(file, null, 2)}\n`;
 }
