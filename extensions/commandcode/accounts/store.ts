@@ -689,8 +689,7 @@ export class AccountStore {
     const seenOperations = new Set<string>();
     const dispositions: Omit<AccountOperationDisposition, "version">[] = [];
     let current = records;
-    let highestApplied = lastAppliedSeq;
-    let reachableAppliedIds = new Set(records.map((record) => record.id));
+    let perReplayHighestApplied = lastAppliedSeq;
     for (const entry of entries) {
       if (
         entry.type !== "op" ||
@@ -704,13 +703,19 @@ export class AccountStore {
       const operation = entry.operation;
       let outcome: AccountOperationOutcome;
       if (operation.kind === "state") {
-        const compactDropsReachable = operation.purpose === "compact" &&
-          [...reachableAppliedIds].some(
-            (id) => !operation.records.some((record) => record.id === id),
+        // An internal compact is only a snapshot of the replay prefix its
+        // preparer observed. Never let it replace effects that arrived after
+        // that prefix, including field changes and removals. Structural
+        // equality is the defensive prefix-identity check: with sequence-
+        // ordered entries, `current` is exactly the pre-replay state plus all
+        // state-changing operations at or below the compact's declared base.
+        const compactMatchesReplayBase = operation.purpose !== "compact" ||
+          (
+            perReplayHighestApplied <= operation.baseLastAppliedSeq &&
+            sameRecords(current, operation.records)
           );
-        if (highestApplied <= operation.baseLastAppliedSeq && !compactDropsReachable) {
+        if (compactMatchesReplayBase && perReplayHighestApplied <= operation.baseLastAppliedSeq) {
           current = operation.records;
-          reachableAppliedIds = new Set(current.map((record) => record.id));
           outcome = "applied";
         } else {
           outcome = "skipped-stale";
@@ -723,17 +728,17 @@ export class AccountStore {
           outcome = "rejected-duplicate";
         } else {
           current = applyNarrowOperation(current, operation);
-          reachableAppliedIds.add(operation.record.id);
           outcome = "applied";
         }
       } else {
         const targetPresent = current.some((record) => record.id === operation.id);
         current = applyNarrowOperation(current, operation);
-        if (operation.kind === "remove") reachableAppliedIds.delete(operation.id);
         outcome = targetPresent || operation.kind === "remove" ? "applied" : "ignored-missing";
       }
       dispositions.push({ opId: entry.opId, outcome, seq: entry.seq });
-      highestApplied = Math.max(highestApplied, entry.seq);
+      if (outcome === "applied") {
+        perReplayHighestApplied = Math.max(perReplayHighestApplied, entry.seq);
+      }
     }
     return { records: current, dispositions };
   }
@@ -810,6 +815,7 @@ export class AccountStore {
         }
         await this.retireLiveJournal();
         await this.deleteDeadArchives();
+        await this.deleteSettledSequenceClaims();
         await this.deleteOldVersions();
         return true;
       });
@@ -897,6 +903,42 @@ export class AccountStore {
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
           throw new AccountStoreError(`Could not delete accounts journal archive at ${archivePath}`, {
+            cause: error,
+          });
+        }
+      }
+    }
+  }
+
+  private async deleteSettledSequenceClaims(): Promise<void> {
+    const authority = await this.readAuthoritativeVersionSnapshot();
+    const authoritativeWatermark = authority?.publicationSeq ?? 0;
+    const settledSequences = new Set([
+      ...(await this.readDispositions()).map((entry) => entry.seq),
+      ...(await this.retainedVersionDispositions()).map((entry) => entry.seq),
+    ]);
+    const prefix = `${basename(this.options.path)}.seq-`;
+    let names: string[];
+    try {
+      names = await readdir(dirname(this.options.path));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return;
+      throw new AccountStoreError(`Could not list accounts journal sequence claims`, {
+        cause: error,
+      });
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith(".claim")) continue;
+      const sequenceText = name.slice(prefix.length, -".claim".length);
+      if (!/^\d+$/.test(sequenceText)) continue;
+      const seq = Number(sequenceText);
+      if (!Number.isSafeInteger(seq)) continue;
+      if (seq > authoritativeWatermark && !settledSequences.has(seq)) continue;
+      try {
+        await rm(join(dirname(this.options.path), name));
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw new AccountStoreError(`Could not collect accounts journal sequence claim ${seq}`, {
             cause: error,
           });
         }
@@ -1136,18 +1178,21 @@ export class AccountStore {
     await this.withJournalLock(async () => {
       try {
         const contents = await this.readJournalContents();
-        const disk = await this.readDiskSnapshotDirect();
-        const journal = await this.readJournal();
-        let maximum = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
-        for (const candidate of await this.versionCandidates()) {
-          maximum = Math.max(maximum, candidate.publicationSeq);
-          for (const disposition of await this.readVersionDispositions(candidate)) {
-            maximum = Math.max(maximum, disposition.seq);
+        let persisted: JournalEntryDraft | (JournalEntryDraft & { readonly seq: number }) = entry;
+        if (entry.type === "op") {
+          const disk = await this.readDiskSnapshotDirect();
+          const journal = await this.readJournal();
+          let maximum = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
+          for (const candidate of await this.versionCandidates()) {
+            maximum = Math.max(maximum, candidate.publicationSeq);
+            for (const disposition of await this.readVersionDispositions(candidate)) {
+              maximum = Math.max(maximum, disposition.seq);
+            }
           }
+          const seq = await this.claimSequence(maximum);
+          persisted = { ...entry, seq };
         }
-        const seq = maximum + 1;
         const framed = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
-        const persisted = entry.type === "op" ? { ...entry, seq } : entry;
         const handle = await open(this.journalPath(), "a", 0o600);
         try {
           await handle.chmod(0o600);
@@ -1155,12 +1200,61 @@ export class AccountStore {
         } finally {
           await handle.close();
         }
+        if (entry.type === "abort") {
+          const journal = await this.readJournal();
+          await this.releaseSequenceClaims(
+            journal.entries.flatMap((candidate) =>
+              candidate.type === "op" && candidate.id === entry.id && candidate.seq !== undefined
+                ? [candidate.seq]
+                : []
+            ),
+          );
+        }
       } catch (error) {
         throw new AccountStoreError(`Could not append accounts journal at ${this.journalPath()}`, {
           cause: error,
         });
       }
     });
+  }
+
+  private async claimSequence(combinedMaximum: number): Promise<number> {
+    if (combinedMaximum >= Number.MAX_SAFE_INTEGER) {
+      throw new AccountStoreError("Accounts journal sequence space is exhausted");
+    }
+    for (let seq = combinedMaximum + 1; Number.isSafeInteger(seq); seq += 1) {
+      const claimPath = this.sequenceClaimPath(seq);
+      try {
+        const handle = await open(claimPath, "wx", 0o600);
+        try {
+          await handle.chmod(0o600);
+        } finally {
+          await handle.close();
+        }
+        return seq;
+      } catch (error) {
+        if (!hasErrorCode(error, "EEXIST")) {
+          throw new AccountStoreError(`Could not claim accounts journal sequence ${seq}`, {
+            cause: error,
+          });
+        }
+      }
+    }
+    throw new AccountStoreError("Accounts journal sequence space is exhausted");
+  }
+
+  private async releaseSequenceClaims(sequences: Iterable<number>): Promise<void> {
+    for (const seq of new Set(sequences)) {
+      try {
+        await rm(this.sequenceClaimPath(seq));
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw new AccountStoreError(`Could not release accounts journal sequence ${seq}`, {
+            cause: error,
+          });
+        }
+      }
+    }
   }
 
   /** Awaitable boundary for process-level append/rotation scheduling tests. */
@@ -1209,6 +1303,10 @@ export class AccountStore {
 
   private journalLockPath(): string {
     return `${this.journalPath()}.lock`;
+  }
+
+  private sequenceClaimPath(seq: number): string {
+    return `${this.options.path}.seq-${seq}.claim`;
   }
 
   protected async withJournalLock<T>(task: () => Promise<T>): Promise<T> {
@@ -1361,8 +1459,12 @@ export class AccountStore {
     const authority = await this.readAuthoritativeVersionSnapshot();
     const won = authority?.name === basename(versionPath);
     if (won) {
-      // The immutable link atomically commits state and outcomes. The sidecar
-      // is a rebuildable cache used to prove recovery evidence before GC.
+      // The immutable link atomically commits state and outcomes. Claims can
+      // be released immediately: the embedded dispositions are durable even
+      // if this process dies before rebuilding the sidecar cache.
+      await this.releaseSequenceClaims(dispositions.map((entry) => entry.seq));
+      // The sidecar is a rebuildable cache used to prove recovery evidence
+      // before journal and old-version GC.
       await this.appendDispositions(dispositions, publicationSeq);
       // Convenience mirror only. A racing, torn, failed, or regressive mirror
       // is harmless because a store that observes versions never falls back to it.

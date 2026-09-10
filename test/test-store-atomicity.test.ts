@@ -44,7 +44,11 @@ async function journalLines(accountsPath: string): Promise<string[]> {
 
 async function expectNoTransientResidue(directory: string): Promise<void> {
   const transient = (await readdir(directory)).filter(
-    (name) => name.endsWith(".lock") || name.endsWith(".tmp") || name.endsWith(".stale"),
+    (name) =>
+      name.endsWith(".lock") ||
+      name.endsWith(".tmp") ||
+      name.endsWith(".stale") ||
+      name.endsWith(".claim"),
   );
   expect(transient).toEqual([]);
 }
@@ -60,6 +64,7 @@ interface ChildMessage {
   readonly transformCalls?: number;
   readonly inode?: number;
   readonly nlink?: number;
+  readonly seq?: number;
 }
 
 function caughtOf(fn: () => unknown): unknown {
@@ -852,6 +857,82 @@ describe("cross-process optimistic concurrency", () => {
       await expect(archivedAdd.onceExited).resolves.toBe(0);
 
       expect([...(await persistedIds(path))].sort()).toEqual(["a", "d", "seed"]);
+    },
+    30_000,
+  );
+
+  test.each(["enable", "remove", "add"] as const)(
+    "Given a live %s allocator holds an exclusive sequence claim before append, When its lease is stolen and a loader prepares a compact from the peer prefix, Then sequences stay unique and the stale compact cannot erase the delayed effect",
+    async (action) => {
+      const dir = await tempDir();
+      const path = join(dir, `claimed-sequence-${action}.json`);
+      const seed = new AccountStore({ path });
+      await seed.add(account("a"));
+      await seed.add(account("b"));
+
+      const delayed = spawnStoreChild(
+        path,
+        action === "add" ? "d" : "a",
+        "pause-before-append-file,pause-after-op,short-stale-lock",
+        action,
+        action === "add" ? "token-d" : "unused",
+        action === "enable" ? "false" : undefined,
+      );
+      const delayedClaim = await delayed.waitForMessage("held-before-append-file");
+      delayed.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(
+        path,
+        "b",
+        "pause-after-op,short-stale-lock",
+        "enable",
+        "unused",
+        "false",
+      );
+      await peer.waitForMessage("held-after-op");
+      const liveEntries = (await journalLines(path)).map((line) => JSON.parse(line) as {
+        readonly seq?: number;
+        readonly operation?: { readonly id?: string };
+      });
+      const peerSeq = liveEntries.find((entry) => entry.operation?.id === "b")?.seq;
+      expect(delayedClaim.seq).toBeTypeOf("number");
+      expect(peerSeq).toBeTypeOf("number");
+      expect(peerSeq).not.toBe(delayedClaim.seq);
+
+      const loader = spawnStoreChild(
+        path,
+        "loader",
+        "pause-before-state,short-stale-lock",
+        "load",
+      );
+      await loader.waitForMessage("held-before-state");
+
+      const delayedAppended = delayed.waitForMessage("held-after-op");
+      delayed.signal("SIGCONT");
+      delayed.stdin.write("resume\n");
+      await delayedAppended;
+
+      const loaded = loader.waitForMessage("persisted");
+      loader.stdin.end("resume\n");
+      await expect(loaded).resolves.toMatchObject({ type: "persisted" });
+      await expect(loader.onceExited).resolves.toBe(0);
+
+      const delayedDone = delayed.waitForMessage("persisted");
+      delayed.stdin.end("resume\n");
+      await expect(delayedDone).resolves.toMatchObject({ type: "persisted" });
+      await expect(delayed.onceExited).resolves.toBe(0);
+
+      const peerDone = peer.waitForMessage("persisted");
+      peer.stdin.end("resume\n");
+      await expect(peerDone).resolves.toMatchObject({ type: "persisted" });
+      await expect(peer.onceExited).resolves.toBe(0);
+
+      const final = await new AccountStore({ path }).load();
+      expect(final.find((record) => record.id === "b")?.enabled).toBe(false);
+      if (action === "enable") expect(final.find((record) => record.id === "a")?.enabled).toBe(false);
+      if (action === "remove") expect(final.some((record) => record.id === "a")).toBe(false);
+      if (action === "add") expect(final.some((record) => record.id === "d")).toBe(true);
+      await expectNoTransientResidue(dir);
     },
     30_000,
   );

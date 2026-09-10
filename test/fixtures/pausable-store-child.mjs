@@ -93,7 +93,11 @@ class ScheduledStore extends AccountStore {
   async appendJournalBytes(handle, contents) {
     if (modes.has("pause-before-append-file") && !this.heldAppendFile) {
       this.heldAppendFile = true;
-      await this.pause("held-before-append-file", { inode: (await handle.stat()).ino });
+      const persisted = JSON.parse(contents.trim());
+      await this.pause("held-before-append-file", {
+        inode: (await handle.stat()).ino,
+        seq: persisted.seq,
+      });
       const resumed = await handle.stat();
       console.log(JSON.stringify({ type: "append-file-resumed", nlink: resumed.nlink }));
     }
@@ -205,6 +209,7 @@ try {
   });
   else if (action === "add-json") await store.add(JSON.parse(value));
   else if (action === "enable") await store.setEnabled(id, value === "true");
+  else if (action === "remove") await store.remove(id);
   else if (action === "state") {
     await store.mutate((records) => {
       transformCalls += 1;
