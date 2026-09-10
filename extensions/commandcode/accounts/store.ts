@@ -173,8 +173,111 @@ function parseJournalEntry(value: unknown): JournalEntry {
   throw new AccountStoreError("Expected recognized journal line type");
 }
 
+type AccountRecordField = Exclude<keyof AccountRecord, "id">;
+
+const ACCOUNT_RECORD_FIELDS: readonly AccountRecordField[] = [
+  "token",
+  "userId",
+  "userName",
+  "keyName",
+  "enabled",
+  "retryAt",
+  "createdAt",
+  "credits",
+];
+
+interface ChangedRecordEffect {
+  readonly id: string;
+  readonly intended: AccountRecord;
+  readonly fields: readonly AccountRecordField[];
+}
+
+interface StateEffect {
+  readonly added: readonly AccountRecord[];
+  readonly removedIds: readonly string[];
+  readonly changed: readonly ChangedRecordEffect[];
+}
+
+function sameCredits(
+  left: AccountRecord["credits"],
+  right: AccountRecord["credits"],
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.monthly === right.monthly &&
+    left.purchased === right.purchased &&
+    left.free === right.free &&
+    left.periodEnd === right.periodEnd
+  );
+}
+
+function sameRecordField(
+  left: AccountRecord,
+  right: AccountRecord,
+  field: AccountRecordField,
+): boolean {
+  if (field === "credits") return sameCredits(left.credits, right.credits);
+  return left[field] === right[field];
+}
+
+function sameRecord(left: AccountRecord, right: AccountRecord): boolean {
+  return (
+    left.id === right.id &&
+    ACCOUNT_RECORD_FIELDS.every((field) => sameRecordField(left, right, field))
+  );
+}
+
 function sameRecords(left: readonly AccountRecord[], right: readonly AccountRecord[]): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return (
+    left.length === right.length &&
+    left.every((record, index) => {
+      const candidate = right[index];
+      return candidate !== undefined && sameRecord(record, candidate);
+    })
+  );
+}
+
+function describeStateEffect(
+  base: readonly AccountRecord[],
+  intended: readonly AccountRecord[],
+): StateEffect {
+  const baseById = new Map(base.map((record) => [record.id, record]));
+  const intendedById = new Map(intended.map((record) => [record.id, record]));
+  const added: AccountRecord[] = [];
+  const changed: ChangedRecordEffect[] = [];
+
+  for (const record of intended) {
+    const baseRecord = baseById.get(record.id);
+    if (baseRecord === undefined) {
+      added.push(record);
+      continue;
+    }
+    const fields = ACCOUNT_RECORD_FIELDS.filter(
+      (field) => !sameRecordField(baseRecord, record, field),
+    );
+    if (fields.length > 0) changed.push({ id: record.id, intended: record, fields });
+  }
+
+  return {
+    added,
+    removedIds: base.filter((record) => !intendedById.has(record.id)).map((record) => record.id),
+    changed,
+  };
+}
+
+function stateEffectPresent(records: readonly AccountRecord[], effect: StateEffect): boolean {
+  const currentById = new Map(records.map((record) => [record.id, record]));
+  if (effect.removedIds.some((id) => currentById.has(id))) return false;
+  if (effect.added.some((record) => {
+    const current = currentById.get(record.id);
+    return current === undefined || !sameRecord(current, record);
+  })) return false;
+  return effect.changed.every((change) => {
+    const current = currentById.get(change.id);
+    return current !== undefined && change.fields.every(
+      (field) => sameRecordField(current, change.intended, field),
+    );
+  });
 }
 
 function applyNarrowOperation(
@@ -277,16 +380,17 @@ export class AccountStore {
   async mutate(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
-    let intended: readonly AccountRecord[] = [];
+    let effect: StateEffect = { added: [], removedIds: [], changed: [] };
     await this.update(
       (records, baseLastAppliedSeq) => {
-        intended = transform(records);
+        const intended = transform(records);
         serializeAccountFile(intended);
+        effect = describeStateEffect(records, intended);
         return sameRecords(records, intended)
           ? null
           : { kind: "state", records: intended, baseLastAppliedSeq };
       },
-      (records) => sameRecords(records, intended),
+      (records) => stateEffectPresent(records, effect),
     );
   }
 
@@ -854,11 +958,9 @@ export class AccountStore {
     intended: AccountRecord,
     input: AccountRecordInput,
   ): boolean {
-    const creditsMatch = input.credits === undefined || (
-      candidate.credits?.monthly === intended.credits?.monthly &&
-      candidate.credits?.purchased === intended.credits?.purchased &&
-      candidate.credits?.free === intended.credits?.free &&
-      candidate.credits?.periodEnd === intended.credits?.periodEnd
+    const creditsMatch = input.credits === undefined || sameCredits(
+      candidate.credits,
+      intended.credits,
     );
     return (
       candidate.id === intended.id &&

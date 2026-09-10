@@ -163,7 +163,7 @@ try {
     await store.mutate((records) =>
       records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
     );
-  } else if (["increment", "toggle", "saturate"].includes(action)) {
+  } else if (["increment", "toggle", "saturate", "reordered-increment"].includes(action)) {
     await store.mutate((records) => {
       transformCalls += 1;
       return records.map((record) => {
@@ -172,6 +172,17 @@ try {
         const monthly = action === "saturate"
           ? Math.min(3, (record.credits?.monthly ?? 0) + 1)
           : (record.credits?.monthly ?? 0) + 1;
+        if (action === "reordered-increment" && record.credits !== undefined) {
+          return {
+            ...record,
+            credits: {
+              monthly,
+              free: record.credits.free,
+              purchased: record.credits.purchased,
+              periodEnd: record.credits.periodEnd,
+            },
+          };
+        }
         return { ...record, credits: { ...record.credits, monthly } };
       });
     });

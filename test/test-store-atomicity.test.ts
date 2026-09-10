@@ -519,6 +519,66 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test.each([
+    ["increment", 1, true],
+    ["toggle", 0, false],
+    ["saturate", 1, true],
+  ])(
+    "Given a non-idempotent %s transform has published, When an unrelated peer add lands before verification, Then the published effect is recognized and not applied again",
+    async (action, expectedMonthly, expectedEnabled) => {
+      const dir = await tempDir();
+      const path = join(dir, `post-publication-${action}.json`);
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-after-write", action);
+      await mutation.waitForMessage("held-after-write");
+      mutation.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(path, "b");
+      await expect(peer.onceExited).resolves.toBe(0);
+      const persistedMessage = mutation.waitForMessage("persisted");
+      mutation.signal("SIGCONT");
+      mutation.stdin.end("resume\n");
+      await expect(mutation.onceExited).resolves.toBe(0);
+      await expect(persistedMessage).resolves.toMatchObject({ transformCalls: 1 });
+
+      const records = await new AccountStore({ path }).load();
+      expect(records.map((record) => record.id)).toEqual(["a", "b"]);
+      expect(records[0]?.credits?.monthly).toBe(expectedMonthly);
+      expect(records[0]?.enabled).toBe(expectedEnabled);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a transform returns credits in a different property order after a genuine stale attempt, When its retry publishes structurally equal values, Then verification succeeds after one logical application",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "reordered-transform-credits.json");
+      await new AccountStore({ path }).add({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+      });
+      const mutation = spawnStoreChild(path, "a", "pause-before-op", "reordered-increment");
+      await mutation.waitForMessage("held-before-op");
+      const peer = spawnStoreChild(path, "b");
+      await expect(peer.onceExited).resolves.toBe(0);
+
+      const persistedMessage = mutation.waitForMessage("persisted");
+      mutation.stdin.end("resume\n");
+      await expect(mutation.onceExited).resolves.toBe(0);
+      await expect(persistedMessage).resolves.toMatchObject({ transformCalls: 2 });
+      const records = await new AccountStore({ path }).load();
+      expect(records.map((record) => record.id)).toEqual(["a", "b"]);
+      expect(records[0]?.credits?.monthly).toBe(1);
+    },
+    30_000,
+  );
+
   test(
     "Given a state mutation is skipped as older than a peer compact, When publication reconciles, Then the mutation retries until its keyName effect is present",
     async () => {
