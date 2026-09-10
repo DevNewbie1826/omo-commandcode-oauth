@@ -27,10 +27,12 @@ import { once } from "node:events";
 import { AccountStore } from "../../extensions/commandcode/accounts/store.ts";
 
 const [path, id, mode, action = "add", token = `token-${id}`, value = ""] = process.argv.slice(2);
+const modes = new Set(mode?.split(",") ?? []);
 
 class ScheduledStore extends AccountStore {
   pausedOnce = false;
-  captures = 0;
+  inCas = false;
+  heldVerify = false;
   heldWrite = false;
   heldJournal = false;
   heldGc = false;
@@ -45,7 +47,7 @@ class ScheduledStore extends AccountStore {
 
   async readFromDisk() {
     const records = await super.readFromDisk();
-    if (mode === "pause-after-read" && !this.pausedOnce) {
+    if (modes.has("pause-after-read") && !this.pausedOnce) {
       this.pausedOnce = true;
       await this.pause("held-after-read", { ids: records.map((r) => r.id) });
     }
@@ -54,20 +56,26 @@ class ScheduledStore extends AccountStore {
 
   async captureIdentity() {
     const identity = await super.captureIdentity();
-    this.captures += 1;
-    if (mode === "pause-after-verify" && this.captures === 2) {
+    if (modes.has("pause-after-verify") && this.inCas && !this.heldVerify) {
+      this.heldVerify = true;
       await this.pause("held-after-verify", { identity });
     }
     return identity;
   }
 
   async persistCas(...args) {
-    if (mode === "conflict-forever") {
+    if (modes.has("conflict-forever")) {
       // Every attempt reports a conflict, so the cycle can never land.
       return false;
     }
-    const landed = await super.persistCas(...args);
-    if (mode === "pause-after-write" && landed && !this.heldWrite) {
+    this.inCas = true;
+    let landed;
+    try {
+      landed = await super.persistCas(...args);
+    } finally {
+      this.inCas = false;
+    }
+    if (modes.has("pause-after-write") && landed && !this.heldWrite) {
       this.heldWrite = true;
       await this.pause("held-after-write");
     }
@@ -75,30 +83,51 @@ class ScheduledStore extends AccountStore {
   }
 
   async appendJournal(entry) {
-    if (mode === "pause-before-op" && entry.type === "op" && !this.heldJournal) {
+    if (modes.has("pause-before-op") && entry.type === "op" && !this.heldJournal) {
       this.heldJournal = true;
       await this.pause("held-before-op");
     }
+    if (modes.has("pause-before-state") && entry.type === "op" && entry.operation.kind === "state") {
+      await this.pause("held-before-state", { operation: entry.operation });
+    }
     await super.appendJournal(entry);
-    if (mode === "pause-after-op" && entry.type === "op" && !this.heldJournal) {
+    if (modes.has("pause-after-op") && entry.type === "op" && !this.heldJournal) {
       this.heldJournal = true;
       await this.pause("held-after-op");
+    }
+    if (modes.has("pause-after-state") && entry.type === "op" && entry.operation.kind === "state") {
+      await this.pause("held-after-state");
     }
   }
 
   async replaceJournalWithEmpty() {
-    if (mode === "pause-before-gc" && !this.heldGc) {
+    if (modes.has("pause-before-gc") && !this.heldGc) {
       this.heldGc = true;
       await this.pause("held-before-gc");
     }
     await super.replaceJournalWithEmpty();
   }
+
+  async withJournalLock(task) {
+    return super.withJournalLock(async () => {
+      if (modes.has("pause-with-lock")) await this.pause("held-with-lock");
+      return task();
+    });
+  }
 }
 
 try {
-  const store = new ScheduledStore({ path, now: () => 1_700_000_000_000 });
+  const store = new ScheduledStore({
+    path,
+    now: () => 1_700_000_000_000,
+    journalLockStaleMs: modes.has("steal-lock-now") ? 0 : undefined,
+  });
   if (action === "load") await store.load();
-  else if (action === "add") await store.add({ id, token });
+  else if (action === "add") await store.add({
+    id,
+    token,
+    ...(value.length === 0 ? {} : { keyName: value }),
+  });
   else if (action === "state") {
     await store.mutate((records) =>
       records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
