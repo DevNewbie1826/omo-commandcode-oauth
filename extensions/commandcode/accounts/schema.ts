@@ -9,11 +9,20 @@
 
 export const ACCOUNTS_FILE_VERSION = 1;
 
+/**
+ * Maximum representable ECMAScript `Date` value in epoch milliseconds. Any
+ * persisted timestamp beyond it (or non-integral, negative, or non-finite)
+ * cannot round-trip through `new Date`/`toISOString` — it corrupts the file on
+ * write (JSON turns Infinity/NaN into null) or poisons later date math with
+ * `RangeError: Invalid Date`.
+ */
+export const MAX_EPOCH_MS = 8.64e15;
+
 export interface AccountCredits {
   readonly monthly: number;
   readonly purchased: number;
   readonly free: number;
-  /** Quota period end, milliseconds since the Unix epoch. */
+  /** Quota period end, epoch milliseconds. Finite integer in [0, 8.64e15]. */
   readonly periodEnd: number;
 }
 
@@ -24,7 +33,7 @@ export interface AccountRecord {
   readonly userName?: string;
   readonly keyName?: string;
   readonly enabled: boolean;
-  /** Cooldown deadline, milliseconds since the Unix epoch; set by quarantine. */
+  /** Cooldown deadline, epoch milliseconds; set by quarantine. Finite integer in [0, 8.64e15]. */
   readonly retryAt?: number;
   /** ISO timestamp of when the account was added. */
   readonly createdAt: string;
@@ -87,11 +96,40 @@ function optionalBoolean(record: Record<string, unknown>, key: string, context: 
   return value;
 }
 
-function optionalNumber(record: Record<string, unknown>, key: string, context: string): number | undefined {
+function isValidEpochMs(value: unknown): value is number {
+  return (
+    typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_EPOCH_MS
+  );
+}
+
+/**
+ * Optional epoch-milliseconds timestamp (`retryAt`). Absent is fine; anything
+ * present must be a finite integer in [0, 8.64e15] — null, negatives,
+ * Infinity and overflowed values are all rejected here so a corrupted file
+ * can never enter the store.
+ */
+function optionalTimestamp(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+): number | undefined {
   const value = record[key];
   if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new AccountStoreError(`Expected ${context} field "${key}" to be a finite number`);
+  if (!isValidEpochMs(value)) {
+    throw new AccountStoreError(
+      `Expected ${context} field "${key}" to be a finite integer epoch-milliseconds timestamp in [0, ${MAX_EPOCH_MS}]`,
+    );
+  }
+  return value;
+}
+
+/** Required epoch-milliseconds timestamp (`credits.periodEnd`); see `optionalTimestamp`. */
+function requiredTimestamp(record: Record<string, unknown>, key: string, context: string): number {
+  const value = record[key];
+  if (!isValidEpochMs(value)) {
+    throw new AccountStoreError(
+      `Expected ${context} field "credits.${key}" to be a finite integer epoch-milliseconds timestamp in [0, ${MAX_EPOCH_MS}]`,
+    );
   }
   return value;
 }
@@ -104,7 +142,7 @@ function parseCredits(value: unknown, context: string): AccountCredits {
     monthly: requiredCreditsNumber(value, "monthly", context),
     purchased: requiredCreditsNumber(value, "purchased", context),
     free: requiredCreditsNumber(value, "free", context),
-    periodEnd: requiredCreditsNumber(value, "periodEnd", context),
+    periodEnd: requiredTimestamp(value, "periodEnd", context),
   };
 }
 
@@ -139,7 +177,7 @@ function parseAccountRecord(value: unknown, index: number): AccountRecord {
     userName: optionalString(value, "userName", context),
     keyName: optionalString(value, "keyName", context),
     enabled: optionalBoolean(value, "enabled", context) ?? true,
-    retryAt: optionalNumber(value, "retryAt", context),
+    retryAt: optionalTimestamp(value, "retryAt", context),
     createdAt,
     credits: creditsValue === undefined ? undefined : parseCredits(creditsValue, context),
   };
@@ -182,8 +220,33 @@ export function parseAccountFile(value: unknown): AccountFile {
   return { version: ACCOUNTS_FILE_VERSION, accounts };
 }
 
-/** Serialize records to the canonical on-disk form (pretty-printed, trailing newline). */
+function assertWritableEpochMs(value: number, field: string): void {
+  if (!isValidEpochMs(value)) {
+    throw new AccountStoreError(
+      `Refusing to persist ${field}: ${String(value)} is not a finite integer epoch-milliseconds timestamp in [0, ${MAX_EPOCH_MS}]`,
+    );
+  }
+}
+
+/**
+ * Serialize records to the canonical on-disk form (pretty-printed, trailing
+ * newline). Refuses to serialize timestamps outside the representable epoch
+ * range: JSON.stringify turns Infinity/NaN into null and overflows would fail
+ * the load boundary, so writing one would replace a valid file with a corrupt
+ * one. The throw happens before any caller touches the filesystem.
+ */
 export function serializeAccountFile(accounts: readonly AccountRecord[]): string {
+  for (const account of accounts) {
+    if (account.retryAt !== undefined) {
+      assertWritableEpochMs(account.retryAt, `account "${account.id}" field "retryAt"`);
+    }
+    if (account.credits !== undefined) {
+      assertWritableEpochMs(
+        account.credits.periodEnd,
+        `account "${account.id}" field "credits.periodEnd"`,
+      );
+    }
+  }
   const file: AccountFile = { version: ACCOUNTS_FILE_VERSION, accounts };
   return `${JSON.stringify(file, null, 2)}\n`;
 }

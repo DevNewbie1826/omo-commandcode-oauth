@@ -254,10 +254,14 @@ export class AccountStore {
     // preserves it onto the credential file. No chmod is needed on any
     // platform we target because "wx" + mode is honored at create time; a
     // defensive chmod would only paper over a reused-temp regression.
+    // Boundary check first: a refused serialization must surface its typed
+    // field-naming error unwrapped, and must happen before any IO so the
+    // previous valid file (or absence of one) is never touched.
+    const contents = serializeAccountFile(records);
     const temporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await mkdir(dirname(this.options.path), { recursive: true });
-      await writeFile(temporaryPath, serializeAccountFile(records), {
+      await writeFile(temporaryPath, contents, {
         encoding: "utf-8",
         flag: "wx",
         mode: 0o600,
