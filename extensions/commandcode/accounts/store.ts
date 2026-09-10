@@ -568,7 +568,6 @@ export class AccountStore {
             if (effectPresent(result.records)) return;
             throw new AccountStoreError("Account credential already exists");
           }
-          if (result.disposition === "skipped-stale" && effectPresent(result.records)) return;
         }
         throw new AccountStoreError("concurrent modification");
       }),

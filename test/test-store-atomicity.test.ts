@@ -1042,6 +1042,46 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test(
+    "Given two same-base increments target the same account, When both are acknowledged, Then the skipped transform retries from fresh state and both increments persist",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "same-target-increments.json");
+      const seed = new AccountStore({ path });
+      for (const id of ["a", "b"]) {
+        await seed.add({
+          id,
+          token: `token-${id}`,
+          credits: { monthly: 0, purchased: 0, free: 0, periodEnd: 200 },
+        });
+      }
+
+      const first = spawnStoreChild(path, "a", "pause-before-op", "increment");
+      const second = spawnStoreChild(path, "a", "pause-before-op", "increment");
+      await Promise.all([
+        first.waitForMessage("held-before-op"),
+        second.waitForMessage("held-before-op"),
+      ]);
+
+      const firstPersisted = first.waitForMessage("persisted");
+      first.stdin.write("resume\n");
+      await expect(firstPersisted).resolves.toMatchObject({ transformCalls: 1 });
+      await expect(first.onceExited).resolves.toBe(0);
+
+      const secondPersisted = second.waitForMessage("persisted");
+      second.stdin.end("resume\n");
+      await expect(secondPersisted).resolves.toMatchObject({ transformCalls: 2 });
+      await expect(second.onceExited).resolves.toBe(0);
+
+      const final = await new AccountStore({ path }).load();
+      expect(final.find((record) => record.id === "a")?.credits?.monthly).toBe(2);
+      await new AccountStore({ path }).add(account("later"));
+      const retained = await new AccountStore({ path }).load();
+      expect(retained.find((record) => record.id === "a")?.credits?.monthly).toBe(2);
+    },
+    30_000,
+  );
+
   test.each([
     ["increment", 1, true],
     ["toggle", 0, false],
