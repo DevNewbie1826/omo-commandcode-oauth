@@ -42,7 +42,9 @@ const DEFAULT_COOLDOWN_MS = 60_000;
  * Canonical retry hint the pi-ai adapter appends to folded 429 failure
  * messages — `… (retry-after-ms: <ms>)`, mirroring `appendRetryAfterMsMarker`
  * in pi-ai's `utils/retry-hint`. The value is bounded like `parseCooldown`'s
- * own timestamps: finite, positive, at most the max valid Date epoch ms.
+ * own timestamps: finite, non-negative (0 = retry-immediately), at most the
+ * max valid Date epoch ms. The per-request tried-set prevents in-request loops
+ * when the hint is 0.
  */
 const RETRY_AFTER_MS_MARKER = /\(retry-after-ms: (\d+)\)$/;
 const MAX_RETRY_HINT_MS = 8.64e15;
@@ -151,18 +153,47 @@ function embeddedJsonBody(message: string): Record<string, unknown> | undefined 
   return isRecord(parsed) ? parsed : undefined;
 }
 
+/** Persistable store timestamps: finite integers in [0, max Date epoch ms]. */
+function isPersistableEpochMs(value: number): boolean {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_RETRY_HINT_MS;
+}
+
 /**
  * Recover the adapter's retry hint from a folded failure message and express it
  * as a Retry-After delta-seconds string. The adapter marker carries whole
- * milliseconds; ceiling keeps the quarantine at or above what upstream asked
- * for, and `parseCooldown`'s `toRetryAtMs` bound re-validates the result.
+ * milliseconds; 0 means retry-immediately (`retryAt = now`). Ceiling keeps a
+ * positive quarantine at or above what upstream asked for, and `parseCooldown`'s
+ * `toRetryAtMs` bound re-validates the result. Negative, non-finite, and values
+ * above the max Date epoch are rejected so the 60s default can apply.
  */
 function retryAfterHintSeconds(message: string): string | undefined {
   const match = RETRY_AFTER_MS_MARKER.exec(message);
   if (match === null) return undefined;
   const ms = Number(match[1]);
-  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_RETRY_HINT_MS) return undefined;
+  if (!Number.isFinite(ms) || ms < 0 || ms > MAX_RETRY_HINT_MS) return undefined;
   return String(Math.ceil(ms / 1000));
+}
+
+/**
+ * Instant to persist for a cooldown. Unwritable parser output (negative,
+ * non-integer, overflow) must not reach the store — that throw aborts rotation.
+ * Drop the body so header / adapter-marker hints can win, matching
+ * `parseCooldown`'s documented fallthrough for invalid resets.
+ */
+function quarantineRetryAtMs(
+  decision: CooldownDecision,
+  cause: FailureCause,
+  nowMs: number,
+  parse: (input: ParseCooldownInput) => CooldownDecision | null,
+): number {
+  const fallback = nowMs + DEFAULT_COOLDOWN_MS;
+  const primary = decision.retryAtMs;
+  if (primary === null) return fallback;
+  if (isPersistableEpochMs(primary)) return primary;
+  const hinted = parse({ ...cooldownInputOf(cause, nowMs), body: {} });
+  const secondary = hinted === null ? null : hinted.retryAtMs;
+  if (secondary !== null && isPersistableEpochMs(secondary)) return secondary;
+  return fallback;
 }
 
 function headersFrom(value: unknown): Record<string, string> | undefined {
@@ -377,7 +408,7 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           if (decision !== null) {
             await options.pool.quarantine(
               lease.id,
-              decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS,
+              quarantineRetryAtMs(decision, outcome.cause, options.now(), options.parseCooldown),
             );
             scheduleBillingRefresh(options, lease.token);
           }
@@ -394,7 +425,10 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           return;
         }
 
-        await options.pool.quarantine(lease.id, decision.retryAtMs ?? options.now() + DEFAULT_COOLDOWN_MS);
+        await options.pool.quarantine(
+          lease.id,
+          quarantineRetryAtMs(decision, outcome.cause, options.now(), options.parseCooldown),
+        );
         scheduleBillingRefresh(options, lease.token);
       }
     } catch (error) {

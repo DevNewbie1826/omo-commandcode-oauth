@@ -569,6 +569,105 @@ describe("createFailoverStream (real adapter wire)", () => {
     expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS + 3_600_000);
     expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
   });
+
+  it("Given the provider answers token-a with 429 and only a Retry-After: 0 header (no JSON body), When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined until now (retry-immediately) and the request completes via token-b", async () => {
+    const { store, pool, clock } = await setupPool(["a", "b"]);
+    const authorizations: string[] = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      const authorization =
+        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
+      if (authorization !== undefined) authorizations.push(authorization);
+      if (authorization !== "Bearer token-b") {
+        // Adapter emits "(retry-after-ms: 0)" meaning retry-immediately; the
+        // transport must persist retryAt === now rather than the 60s default.
+        response.writeHead(429, { "retry-after": "0" });
+        response.end("slow down");
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(ANTHROPIC_SSE_SUCCESS);
+    });
+    staleServers.push(server);
+    const port = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          reject(new Error("Expected the zero-hint server to bind a TCP port"));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+
+    const wireModel: Model<"anthropic-messages"> = {
+      ...MODEL,
+      baseUrl: `http://127.0.0.1:${port}/provider`,
+    };
+    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
+
+    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
+
+    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
+    expect(events.at(-1)?.type).toBe("done");
+    const records = await store.load();
+    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS);
+    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
+  });
+
+  it("Given token-a 429 with rateLimit.reset: -1 plus Retry-After: 3600 and a healthy token-b, When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined for the hour (not -1000), token-b is attempted, the stream succeeds, and the accounts file still loads", async () => {
+    const { store, pool, clock } = await setupPool(["a", "b"]);
+    const authorizations: string[] = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      const authorization =
+        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
+      if (authorization !== undefined) authorizations.push(authorization);
+      if (authorization !== "Bearer token-b") {
+        response.writeHead(429, { "content-type": "application/json", "retry-after": "3600" });
+        response.end(
+          JSON.stringify({
+            error: { type: "rate_limit_error", rateLimit: { reset: -1 }, message: "slow down" },
+          }),
+        );
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(ANTHROPIC_SSE_SUCCESS);
+    });
+    staleServers.push(server);
+    const port = await new Promise<number>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          reject(new Error("Expected the invalid-hint server to bind a TCP port"));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+
+    const wireModel: Model<"anthropic-messages"> = {
+      ...MODEL,
+      baseUrl: `http://127.0.0.1:${port}/provider`,
+    };
+    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
+
+    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
+
+    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
+    expect(events.at(-1)?.type).toBe("done");
+    const records = await store.load();
+    // Invalid body reset (-1 → -1000ms) must not win over the valid Retry-After: 3600
+    // header / adapter marker; the composed pipeline falls through to the hour.
+    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS + 3_600_000);
+    expect(records.find((record) => record.id === "a")?.retryAt).not.toBe(-1000);
+    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
+  });
 });
 
 describe("pinned options.apiKey", () => {
