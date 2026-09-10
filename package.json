@@ -7,7 +7,8 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "node scripts/dedupe-senpi-pi-ai.mjs"
   },
   "dependencies": {},
   "devDependencies": {
