@@ -56,6 +56,8 @@ export interface AccountRecordInput {
 export interface AccountFile {
   readonly version: typeof ACCOUNTS_FILE_VERSION;
   readonly accounts: readonly AccountRecord[];
+  /** Highest journal sequence incorporated by this state snapshot. */
+  readonly lastAppliedSeq?: number;
 }
 
 /** Domain error for every accounts-file failure: parse, IO, or invariant. */
@@ -225,7 +227,21 @@ export function parseAccountFile(value: unknown): AccountFile {
     seenTokens.add(account.token);
   }
 
-  return { version: ACCOUNTS_FILE_VERSION, accounts };
+  const lastAppliedSeqValue = value["lastAppliedSeq"];
+  if (
+    lastAppliedSeqValue !== undefined &&
+    (typeof lastAppliedSeqValue !== "number" ||
+      !Number.isSafeInteger(lastAppliedSeqValue) ||
+      lastAppliedSeqValue < 0)
+  ) {
+    throw new AccountStoreError(
+      'Expected accounts file field "lastAppliedSeq" to be a non-negative safe integer',
+    );
+  }
+
+  return lastAppliedSeqValue === undefined
+    ? { version: ACCOUNTS_FILE_VERSION, accounts }
+    : { version: ACCOUNTS_FILE_VERSION, accounts, lastAppliedSeq: lastAppliedSeqValue };
 }
 
 function assertWritableEpochMs(value: number, field: string): void {
@@ -243,7 +259,10 @@ function assertWritableEpochMs(value: number, field: string): void {
  * the load boundary, so writing one would replace a valid file with a corrupt
  * one. The throw happens before any caller touches the filesystem.
  */
-export function serializeAccountFile(accounts: readonly AccountRecord[]): string {
+export function serializeAccountFile(
+  accounts: readonly AccountRecord[],
+  lastAppliedSeq?: number,
+): string {
   for (const account of accounts) {
     if (account.retryAt !== undefined) {
       assertWritableEpochMs(account.retryAt, `account "${account.id}" field "retryAt"`);
@@ -255,6 +274,17 @@ export function serializeAccountFile(accounts: readonly AccountRecord[]): string
       );
     }
   }
-  const file: AccountFile = { version: ACCOUNTS_FILE_VERSION, accounts };
+  if (
+    lastAppliedSeq !== undefined &&
+    (!Number.isSafeInteger(lastAppliedSeq) || lastAppliedSeq < 0)
+  ) {
+    throw new AccountStoreError(
+      "Refusing to persist lastAppliedSeq: expected a non-negative safe integer",
+    );
+  }
+  const file: AccountFile =
+    lastAppliedSeq === undefined
+      ? { version: ACCOUNTS_FILE_VERSION, accounts }
+      : { version: ACCOUNTS_FILE_VERSION, accounts, lastAppliedSeq };
   return `${JSON.stringify(file, null, 2)}\n`;
 }

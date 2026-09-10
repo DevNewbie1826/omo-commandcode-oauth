@@ -1,20 +1,9 @@
 /*
- * `AccountStore` persists credentials with an identity-CAS fast path plus a
- * write-ahead journal. Every operation is appended to `${path}.journal`
- * before its account-file CAS and is marked committed only after that CAS.
- * Replaying the journal repairs a peer operation overwritten in the final
- * stat-to-rename window. Pending operations are never garbage-collected, so
- * a stale writer remains recoverable until it finishes. Both the credential
- * file and journal contain tokens and are created/rewritten with mode 0600.
- *
- * add/remove/enable/quarantine records are deterministic and idempotent;
- * operations for different account ids commute. The public arbitrary
- * `mutate()` escape hatch cannot in general be represented that way. Simple
- * enabled and monotonic retryAt changes are narrowed to deterministic ops;
- * every other transform is journaled as a full-state operation carrying its
- * base file identity and sequence id. State operations replay in journal
- * order (later snapshots win), which is honest last-writer ordering rather
- * than per-account commutativity for an unknowable arbitrary transform.
+ * `AccountStore` uses an append-only write-ahead journal plus identity-CAS
+ * publication. Every operation and every derived-state publication receives
+ * a monotonically increasing sequence number. The accounts file records the
+ * highest sequence incorporated by its snapshot, allowing replay and journal
+ * collection to distinguish stale publications from later operations.
  */
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -41,14 +30,12 @@ export function resolveAccountsFilePath(
 
 export interface AccountStoreOptions {
   readonly path: string;
-  /** Injected clock used to default `createdAt` on newly added accounts. */
   readonly now?: () => number;
-  /** Receives non-fatal typed warnings for malformed journal lines. */
   readonly onWarning?: (warning: AccountStoreJournalWarning) => void;
 }
 
-function isMissingFileError(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
+function hasErrorCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,6 +43,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const MAX_WRITE_ATTEMPTS = 8;
+const MAX_JOURNAL_LOCK_ATTEMPTS = 10_000;
 
 type FileIdentity =
   | { readonly kind: "missing" }
@@ -73,12 +61,16 @@ type StoreOperation =
   | { readonly kind: "enable"; readonly id: string; readonly enabled: boolean }
   | {
       readonly kind: "state";
+      readonly baseLastAppliedSeq: number;
       readonly records: readonly AccountRecord[];
-      readonly baseIdentity: FileIdentity;
-      readonly seq: string;
     };
 
 type JournalEntry =
+  | { readonly type: "op"; readonly id: string; readonly seq?: number; readonly operation: StoreOperation }
+  | { readonly type: "commit"; readonly id: string }
+  | { readonly type: "abort"; readonly id: string };
+
+type JournalEntryDraft =
   | { readonly type: "op"; readonly id: string; readonly operation: StoreOperation }
   | { readonly type: "commit"; readonly id: string }
   | { readonly type: "abort"; readonly id: string };
@@ -86,6 +78,12 @@ type JournalEntry =
 interface JournalSnapshot {
   readonly contents: string;
   readonly entries: readonly JournalEntry[];
+}
+
+interface DiskSnapshot {
+  readonly records: readonly AccountRecord[];
+  readonly lastAppliedSeq: number;
+  readonly exists: boolean;
 }
 
 let processCycleTail: Promise<unknown> = Promise.resolve();
@@ -96,24 +94,11 @@ function exclusiveAcrossInstances<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
-function parseIdentity(value: unknown): FileIdentity {
-  if (!isRecord(value)) throw new AccountStoreError("Expected journal base identity object");
-  if (value["kind"] === "missing") return { kind: "missing" };
-  const inode = value["inode"];
-  const mtimeMs = value["mtimeMs"];
-  const size = value["size"];
-  if (
-    value["kind"] !== "present" ||
-    typeof inode !== "number" ||
-    !Number.isFinite(inode) ||
-    typeof mtimeMs !== "number" ||
-    !Number.isFinite(mtimeMs) ||
-    typeof size !== "number" ||
-    !Number.isFinite(size)
-  ) {
-    throw new AccountStoreError("Expected valid journal base identity");
+function parseNonNegativeSequence(value: unknown, context: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new AccountStoreError(`Expected ${context} to be a non-negative safe integer`);
   }
-  return { kind: "present", inode, mtimeMs, size };
+  return value;
 }
 
 function parseSingleAccount(value: unknown): AccountRecord {
@@ -157,9 +142,11 @@ function parseOperation(value: unknown): StoreOperation {
     }).accounts;
     return {
       kind,
+      baseLastAppliedSeq: parseNonNegativeSequence(
+        value["baseLastAppliedSeq"],
+        'journal field "baseLastAppliedSeq"',
+      ),
       records,
-      baseIdentity: parseIdentity(value["baseIdentity"]),
-      seq: requiredJournalString(value, "seq"),
     };
   }
   throw new AccountStoreError("Expected recognized journal operation kind");
@@ -170,7 +157,14 @@ function parseJournalEntry(value: unknown): JournalEntry {
   const type = value["type"];
   const id = requiredJournalString(value, "id");
   if (type === "commit" || type === "abort") return { type, id };
-  if (type === "op") return { type, id, operation: parseOperation(value["operation"]) };
+  if (type === "op") {
+    return {
+      type,
+      id,
+      seq: parseNonNegativeSequence(value["seq"], 'journal field "seq"'),
+      operation: parseOperation(value["operation"]),
+    };
+  }
   throw new AccountStoreError("Expected recognized journal line type");
 }
 
@@ -178,23 +172,24 @@ function sameRecord(left: AccountRecord, right: AccountRecord): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function applyOperation(
+function sameRecords(left: readonly AccountRecord[], right: readonly AccountRecord[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function applyNarrowOperation(
   records: readonly AccountRecord[],
-  operation: StoreOperation,
+  operation: Exclude<StoreOperation, { readonly kind: "state" }>,
 ): readonly AccountRecord[] {
-  if (operation.kind === "state") return operation.records;
   if (operation.kind === "remove") return records.filter((record) => record.id !== operation.id);
   if (operation.kind === "add") {
-    const existing = records.find((record) => record.id === operation.record.id);
-    if (existing !== undefined) return records;
+    if (records.some((record) => record.id === operation.record.id)) return records;
     if (records.some((record) => record.token === operation.record.token)) return records;
     return [...records, operation.record];
   }
   return records.map((record) => {
     if (record.id !== operation.id) return record;
     if (operation.kind === "enable") return { ...record, enabled: operation.enabled };
-    const retryAt = Math.max(record.retryAt ?? 0, operation.retryAtMs);
-    return { ...record, retryAt };
+    return { ...record, retryAt: Math.max(record.retryAt ?? 0, operation.retryAtMs) };
   });
 }
 
@@ -202,12 +197,13 @@ export class AccountStore {
   private records: readonly AccountRecord[] = [];
   private writeTail: Promise<unknown> = Promise.resolve();
   private readonly clock: () => number;
+  private lastReadAppliedSeq = 0;
+  private lastReadExists = false;
 
   constructor(private readonly options: AccountStoreOptions) {
     this.clock = options.now ?? (() => Date.now());
   }
 
-  /** In-memory snapshot of the last loaded/persisted state. */
   accounts(): readonly AccountRecord[] {
     return this.records;
   }
@@ -221,19 +217,28 @@ export class AccountStore {
     );
   }
 
-  /** Append an account; rejects duplicate ids and duplicate credentials. */
   async add(input: AccountRecordInput): Promise<void> {
     const record = this.normalize(input);
     serializeAccountFile([record]);
-    await this.update((records) => {
-      if (records.some((candidate) => candidate.id === record.id)) {
+    await this.update(
+      (records) => {
+        if (records.some((candidate) => candidate.id === record.id)) {
+          throw new AccountStoreError(`Account id already exists: ${record.id}`);
+        }
+        if (records.some((candidate) => candidate.token === record.token)) {
+          throw new AccountStoreError("Account credential already exists");
+        }
+        return { kind: "add", record };
+      },
+      (records) => {
+        const matchingId = records.find((candidate) => candidate.id === record.id);
+        if (matchingId?.token === record.token) return;
+        if (records.some((candidate) => candidate.token === record.token)) {
+          throw new AccountStoreError("Account credential already exists");
+        }
         throw new AccountStoreError(`Account id already exists: ${record.id}`);
-      }
-      if (records.some((candidate) => candidate.token === record.token)) {
-        throw new AccountStoreError("Account credential already exists");
-      }
-      return { kind: "add", record };
-    });
+      },
+    );
   }
 
   async remove(id: string): Promise<void> {
@@ -247,58 +252,84 @@ export class AccountStore {
 
   async setEnabled(id: string, enabled: boolean): Promise<void> {
     await this.update((records) => {
-      if (!records.some((record) => record.id === id)) {
-        throw new AccountStoreError(`Unknown account id: ${id}`);
-      }
-      return { kind: "enable", id, enabled };
+      const record = records.find((candidate) => candidate.id === id);
+      if (record === undefined) throw new AccountStoreError(`Unknown account id: ${id}`);
+      return record.enabled === enabled ? null : { kind: "enable", id, enabled };
     });
   }
 
   async mutate(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
-    await this.update((records, identity) => {
+    await this.update((records, baseLastAppliedSeq) => {
       const next = transform(records);
       serializeAccountFile(next);
-      return this.narrowMutation(records, next, identity);
+      return this.narrowMutation(records, next, baseLastAppliedSeq);
     });
   }
 
   private async update(
-    createOperation: (records: readonly AccountRecord[], identity: FileIdentity) => StoreOperation,
+    createOperation: (
+      records: readonly AccountRecord[],
+      baseLastAppliedSeq: number,
+    ) => StoreOperation | null,
+    verify?: (records: readonly AccountRecord[]) => void,
   ): Promise<void> {
     await this.exclusive(() =>
-      exclusiveAcrossInstances(() => this.persistOperation(createOperation)),
+      exclusiveAcrossInstances(async () => {
+        const records = await this.persistOperation(createOperation);
+        if (verify !== undefined) verify(records);
+      }),
     );
   }
 
   private async persistOperation(
-    createOperation: (records: readonly AccountRecord[], identity: FileIdentity) => StoreOperation,
-  ): Promise<void> {
+    createOperation: (
+      records: readonly AccountRecord[],
+      baseLastAppliedSeq: number,
+    ) => StoreOperation | null,
+  ): Promise<readonly AccountRecord[]> {
     let identity = await this.captureIdentity();
-    let diskRecords = await this.readFromDisk();
+    let disk = await this.readDiskSnapshot();
     let journal = await this.readJournal();
-    const current = this.replay(diskRecords, journal.entries);
-    const operation = createOperation(current, identity);
+    const baseSequence = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
+    const current = this.replay(disk.records, journal.entries, disk.lastAppliedSeq);
+    const operation = createOperation(current, baseSequence);
+    if (operation === null || sameRecords(current, applyOperationForComparison(current, operation))) {
+      this.records = current;
+      return current;
+    }
+
     const operationId = randomUUID();
     await this.appendJournal({ type: "op", id: operationId, operation });
 
     try {
       for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
-        if (attempt > 1) {
-          identity = await this.captureIdentity();
-          diskRecords = await this.readFromDisk();
-          journal = await this.readJournal();
-        } else {
-          journal = await this.readJournal();
-        }
-        const next = this.replay(diskRecords, journal.entries);
-        const contents = serializeAccountFile(next);
-        if (await this.persistCas(identity, contents)) {
+        identity = await this.captureIdentity();
+        disk = await this.readDiskSnapshot();
+        journal = await this.readJournal();
+        const replayed = this.replay(disk.records, journal.entries, disk.lastAppliedSeq);
+        const compactBase = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
+        const compactId = randomUUID();
+        await this.appendJournal({
+          type: "op",
+          id: compactId,
+          operation: { kind: "state", baseLastAppliedSeq: compactBase, records: replayed },
+        });
+        const withCompact = await this.readJournal();
+        const compactSeq = this.operationSequence(withCompact.entries, compactId);
+        const publishRecords = this.replay(
+          disk.records,
+          withCompact.entries,
+          disk.lastAppliedSeq,
+        );
+        if (await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq))) {
+          await this.appendJournal({ type: "commit", id: compactId });
           await this.appendJournal({ type: "commit", id: operationId });
           this.records = await this.reconcile();
-          return;
+          return this.records;
         }
+        await this.appendJournal({ type: "abort", id: compactId });
       }
     } catch (error) {
       await this.abortOperation(operationId);
@@ -313,90 +344,151 @@ export class AccountStore {
 
   private async abortOperation(operationId: string): Promise<void> {
     await this.appendJournal({ type: "abort", id: operationId });
-    await this.reconcile();
+    await this.collectJournal();
   }
 
   private narrowMutation(
     previous: readonly AccountRecord[],
     next: readonly AccountRecord[],
-    baseIdentity: FileIdentity,
-  ): StoreOperation {
-    if (previous.length === next.length) {
-      const changed = previous.flatMap((record) => {
-        const replacement = next.find((candidate) => candidate.id === record.id);
+    baseLastAppliedSeq: number,
+  ): StoreOperation | null {
+    if (sameRecords(previous, next)) return null;
+    const sameMembershipAndOrder =
+      previous.length === next.length &&
+      previous.every((record, index) => next[index]?.id === record.id);
+    if (sameMembershipAndOrder) {
+      const changed = previous.flatMap((record, index) => {
+        const replacement = next[index];
         return replacement !== undefined && !sameRecord(record, replacement)
           ? [{ previous: record, next: replacement }]
           : [];
       });
       const [change] = changed;
       if (changed.length === 1 && change !== undefined) {
-        const enabledOnly = sameRecord(
-          { ...change.previous, enabled: change.next.enabled },
-          change.next,
-        );
-        if (enabledOnly) {
+        if (sameRecord({ ...change.previous, enabled: change.next.enabled }, change.next)) {
           return { kind: "enable", id: change.next.id, enabled: change.next.enabled };
         }
-        const nextRetryAt = change.next.retryAt;
-        const quarantineOnly =
-          nextRetryAt !== undefined &&
-          sameRecord({ ...change.previous, retryAt: nextRetryAt }, change.next) &&
-          nextRetryAt >= (change.previous.retryAt ?? 0);
-        if (quarantineOnly) {
-          return { kind: "quarantine", id: change.next.id, retryAtMs: nextRetryAt };
+        const retryAt = change.next.retryAt;
+        if (
+          retryAt !== undefined &&
+          retryAt > (change.previous.retryAt ?? 0) &&
+          sameRecord({ ...change.previous, retryAt }, change.next)
+        ) {
+          return { kind: "quarantine", id: change.next.id, retryAtMs: retryAt };
         }
       }
     }
-    return { kind: "state", records: next, baseIdentity, seq: randomUUID() };
+    return { kind: "state", records: next, baseLastAppliedSeq };
   }
 
   private replay(
     records: readonly AccountRecord[],
     entries: readonly JournalEntry[],
+    lastAppliedSeq = 0,
   ): readonly AccountRecord[] {
     const aborted = new Set(
       entries.filter((entry) => entry.type === "abort").map((entry) => entry.id),
     );
-    return entries.reduce(
-      (current, entry) =>
-        entry.type === "op" && !aborted.has(entry.id)
-          ? applyOperation(current, entry.operation)
-          : current,
-      records,
-    );
+    let current = records;
+    let highestApplied = lastAppliedSeq;
+    for (const entry of entries) {
+      if (entry.type !== "op" || aborted.has(entry.id)) continue;
+      const seq = entry.seq;
+      if (seq !== undefined && seq <= lastAppliedSeq) continue;
+      if (entry.operation.kind === "state") {
+        if (highestApplied <= entry.operation.baseLastAppliedSeq) current = entry.operation.records;
+      } else {
+        current = applyNarrowOperation(current, entry.operation);
+      }
+      if (seq !== undefined) highestApplied = Math.max(highestApplied, seq);
+    }
+    return current;
   }
 
   private async reconcile(): Promise<readonly AccountRecord[]> {
     for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
       const identity = await this.captureIdentity();
-      const diskRecords = await this.readFromDisk();
+      const disk = await this.readDiskSnapshot();
       const journal = await this.readJournal();
-      const replayed = this.replay(diskRecords, journal.entries);
-      if (serializeAccountFile(replayed) !== serializeAccountFile(diskRecords)) {
-        if (!(await this.persistCas(identity, serializeAccountFile(replayed)))) continue;
+      const replayed = this.replay(disk.records, journal.entries, disk.lastAppliedSeq);
+      const maximumSeq = this.maximumSequence(journal.entries, disk.lastAppliedSeq);
+      const needsPublication = maximumSeq > disk.lastAppliedSeq;
+      if (!needsPublication) {
+        if (journal.entries.length > 0) await this.collectJournal();
+        return replayed;
       }
-      await this.collectJournal(journal);
-      return replayed;
+
+      const compactId = randomUUID();
+      await this.appendJournal({
+        type: "op",
+        id: compactId,
+        operation: {
+          kind: "state",
+          baseLastAppliedSeq: maximumSeq,
+          records: replayed,
+        },
+      });
+      const withCompact = await this.readJournal();
+      const compactSeq = this.operationSequence(withCompact.entries, compactId);
+      const publishRecords = this.replay(disk.records, withCompact.entries, disk.lastAppliedSeq);
+      if (!(await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq)))) {
+        await this.appendJournal({ type: "abort", id: compactId });
+        continue;
+      }
+      await this.appendJournal({ type: "commit", id: compactId });
+      await this.collectJournal();
+      return publishRecords;
     }
     throw new AccountStoreError(
       `Accounts file at ${this.options.path} kept changing while reconciling the journal`,
     );
   }
 
-  private async collectJournal(snapshot: JournalSnapshot): Promise<void> {
-    const operationIds = snapshot.entries
-      .filter((entry) => entry.type === "op")
-      .map((entry) => entry.id);
-    const settled = new Set(
-      snapshot.entries
-        .filter((entry) => entry.type === "commit" || entry.type === "abort")
-        .map((entry) => entry.id),
-    );
-    if (operationIds.some((id) => !settled.has(id))) return;
-
-    const currentContents = await this.readJournalContents();
-    if (currentContents !== snapshot.contents) return;
+  private async collectJournal(): Promise<void> {
     await this.replaceJournalWithEmpty();
+  }
+
+  protected async replaceJournalWithEmpty(): Promise<void> {
+    await this.withJournalLock(async () => {
+      const disk = await this.readDiskSnapshotDirect();
+      const journal = await this.readJournal();
+      if (journal.entries.length === 0) return;
+      const settled = new Set(
+        journal.entries
+          .filter((entry) => entry.type === "commit" || entry.type === "abort")
+          .map((entry) => entry.id),
+      );
+      const operations = journal.entries.filter((entry) => entry.type === "op");
+      const allAborted = operations.every((entry) =>
+        journal.entries.some((marker) => marker.type === "abort" && marker.id === entry.id),
+      );
+      const safeThroughState = operations.every(
+        (entry) =>
+          entry.seq !== undefined &&
+          entry.seq <= disk.lastAppliedSeq &&
+          settled.has(entry.id),
+      );
+      if (!allAborted && !safeThroughState) return;
+      const temporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        if (disk.exists && disk.lastAppliedSeq > 0) {
+          await writeFile(temporaryPath, serializeAccountFile(disk.records), {
+            encoding: "utf-8",
+            flag: "wx",
+            mode: 0o600,
+          });
+          await rename(temporaryPath, this.options.path);
+        }
+        await rm(this.journalPath(), { force: true });
+      } catch (error) {
+        await this.removeTemporary(temporaryPath, error);
+        throw new AccountStoreError(
+          `Could not garbage-collect accounts journal at ${this.journalPath()}`,
+          { cause: error },
+        );
+      }
+      await this.removeTemporary(temporaryPath);
+    });
   }
 
   private async readJournal(): Promise<JournalSnapshot> {
@@ -425,47 +517,123 @@ export class AccountStore {
     try {
       return await readFile(this.journalPath(), "utf-8");
     } catch (error) {
-      if (isMissingFileError(error)) return "";
+      if (hasErrorCode(error, "ENOENT")) return "";
       throw new AccountStoreError(`Could not read accounts journal at ${this.journalPath()}`, {
         cause: error,
       });
     }
   }
 
-  private async appendJournal(entry: JournalEntry): Promise<void> {
-    try {
-      await mkdir(dirname(this.options.path), { recursive: true });
-      const handle = await open(this.journalPath(), "a", 0o600);
+  protected async appendJournal(entry: JournalEntryDraft): Promise<void> {
+    await this.withJournalLock(async () => {
       try {
-        await handle.chmod(0o600);
-        await handle.appendFile(`${JSON.stringify(entry)}\n`, "utf-8");
-      } finally {
-        await handle.close();
+        const contents = await this.readJournalContents();
+        const disk = await this.readDiskSnapshotDirect();
+        const parsed = await this.parseJournalContentsWithoutWarnings(contents);
+        const seq = this.maximumSequence(parsed, disk.lastAppliedSeq) + 1;
+        const framed = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
+        const persisted = entry.type === "op" ? { ...entry, seq } : entry;
+        const handle = await open(this.journalPath(), "a", 0o600);
+        try {
+          await handle.chmod(0o600);
+          await handle.appendFile(`${framed}${JSON.stringify(persisted)}\n`, "utf-8");
+        } finally {
+          await handle.close();
+        }
+      } catch (error) {
+        throw new AccountStoreError(`Could not append accounts journal at ${this.journalPath()}`, {
+          cause: error,
+        });
       }
-    } catch (error) {
-      throw new AccountStoreError(`Could not append accounts journal at ${this.journalPath()}`, {
-        cause: error,
-      });
-    }
+    });
   }
 
-  private async replaceJournalWithEmpty(): Promise<void> {
-    const temporaryPath = `${this.journalPath()}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(temporaryPath, "", { encoding: "utf-8", flag: "wx", mode: 0o600 });
-      await rename(temporaryPath, this.journalPath());
-      await rm(this.journalPath(), { force: true });
-    } catch (error) {
-      await this.removeTemporary(temporaryPath, error);
-      throw new AccountStoreError(`Could not garbage-collect accounts journal at ${this.journalPath()}`, {
-        cause: error,
-      });
+  private async parseJournalContentsWithoutWarnings(contents: string): Promise<readonly JournalEntry[]> {
+    const entries: JournalEntry[] = [];
+    for (const line of contents.split("\n")) {
+      if (line.length === 0) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        entries.push(parseJournalEntry(parsed));
+      } catch (error) {
+        if (!(error instanceof Error)) {
+          throw new AccountStoreError("Unexpected non-error while parsing accounts journal", {
+            cause: error,
+          });
+        }
+      }
     }
-    await this.removeTemporary(temporaryPath);
+    return entries;
+  }
+
+  private maximumSequence(entries: readonly JournalEntry[], floor: number): number {
+    return entries.reduce(
+      (maximum, entry) =>
+        entry.type === "op" && entry.seq !== undefined ? Math.max(maximum, entry.seq) : maximum,
+      floor,
+    );
+  }
+
+  private operationSequence(entries: readonly JournalEntry[], id: string): number {
+    const operation = entries.find((entry) => entry.type === "op" && entry.id === id);
+    if (operation === undefined || operation.type !== "op" || operation.seq === undefined) {
+      throw new AccountStoreError(`Could not find appended journal operation ${id}`);
+    }
+    return operation.seq;
   }
 
   private journalPath(): string {
     return `${this.options.path}.journal`;
+  }
+
+  private journalLockPath(): string {
+    return `${this.journalPath()}.lock`;
+  }
+
+  private async withJournalLock<T>(task: () => Promise<T>): Promise<T> {
+    await mkdir(dirname(this.options.path), { recursive: true });
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    for (let attempt = 1; attempt <= MAX_JOURNAL_LOCK_ATTEMPTS; attempt += 1) {
+      try {
+        handle = await open(this.journalLockPath(), "wx", 0o600);
+        break;
+      } catch (error) {
+        if (!hasErrorCode(error, "EEXIST")) {
+          throw new AccountStoreError(`Could not lock accounts journal at ${this.journalPath()}`, {
+            cause: error,
+          });
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+    if (handle === undefined) {
+      throw new AccountStoreError(`Timed out locking accounts journal at ${this.journalPath()}`);
+    }
+    try {
+      return await task();
+    } finally {
+      let closeError: unknown;
+      try {
+        await handle.close();
+      } catch (error) {
+        closeError = error;
+      }
+      try {
+        await rm(this.journalLockPath(), { force: true });
+      } catch (error) {
+        const cause = closeError === undefined
+          ? error
+          : new AggregateError([closeError, error], "lock close and cleanup both failed");
+        throw new AccountStoreError(`Could not release accounts journal lock at ${this.journalPath()}`, {
+          cause,
+        });
+      }
+      if (closeError !== undefined) {
+        throw new AccountStoreError(`Could not close accounts journal lock at ${this.journalPath()}`, {
+          cause: closeError,
+        });
+      }
+    }
   }
 
   private warn(warning: AccountStoreJournalWarning): void {
@@ -478,7 +646,7 @@ export class AccountStore {
       const stats = await stat(this.options.path);
       return { kind: "present", inode: stats.ino, mtimeMs: stats.mtimeMs, size: stats.size };
     } catch (error) {
-      if (isMissingFileError(error)) return { kind: "missing" };
+      if (hasErrorCode(error, "ENOENT")) return { kind: "missing" };
       throw new AccountStoreError(`Could not inspect accounts file at ${this.options.path}`, {
         cause: error,
       });
@@ -543,17 +711,27 @@ export class AccountStore {
     return run;
   }
 
-  protected async readFromDisk(): Promise<readonly AccountRecord[]> {
+  private async readDiskSnapshot(): Promise<DiskSnapshot> {
+    const records = await this.readFromDisk();
+    return {
+      records,
+      lastAppliedSeq: this.lastReadAppliedSeq,
+      exists: this.lastReadExists,
+    };
+  }
+
+  private async readDiskSnapshotDirect(): Promise<DiskSnapshot> {
     let contents: string;
     try {
       contents = await readFile(this.options.path, "utf-8");
     } catch (error) {
-      if (isMissingFileError(error)) return [];
+      if (hasErrorCode(error, "ENOENT")) {
+        return { records: [], lastAppliedSeq: 0, exists: false };
+      }
       throw new AccountStoreError(`Could not read accounts file at ${this.options.path}`, {
         cause: error,
       });
     }
-
     let parsed: unknown;
     try {
       parsed = JSON.parse(contents);
@@ -562,6 +740,25 @@ export class AccountStore {
         cause: error,
       });
     }
-    return parseAccountFile(parsed).accounts;
+    const file = parseAccountFile(parsed);
+    return {
+      records: file.accounts,
+      lastAppliedSeq: file.lastAppliedSeq ?? 0,
+      exists: true,
+    };
   }
+
+  protected async readFromDisk(): Promise<readonly AccountRecord[]> {
+    const snapshot = await this.readDiskSnapshotDirect();
+    this.lastReadAppliedSeq = snapshot.lastAppliedSeq;
+    this.lastReadExists = snapshot.exists;
+    return snapshot.records;
+  }
+}
+
+function applyOperationForComparison(
+  records: readonly AccountRecord[],
+  operation: StoreOperation,
+): readonly AccountRecord[] {
+  return operation.kind === "state" ? operation.records : applyNarrowOperation(records, operation);
 }

@@ -140,9 +140,19 @@ describe("cross-process optimistic concurrency", () => {
     return executable.endsWith("bun") ? executable : "bun";
   }
 
-  function spawnStoreChild(accountsPath: string, id: string, mode?: string): ManagedChild {
+  function spawnStoreChild(
+    accountsPath: string,
+    id: string,
+    mode?: string,
+    action?: string,
+    token?: string,
+    value?: string,
+  ): ManagedChild {
     const fixture = fileURLToPath(new URL("./fixtures/pausable-store-child.mjs", import.meta.url));
-    const args = mode === undefined ? [fixture, accountsPath, id] : [fixture, accountsPath, id, mode];
+    const optional = [mode, action, token, value].filter(
+      (argument): argument is string => argument !== undefined,
+    );
+    const args = [fixture, accountsPath, id, ...optional];
     const child = spawn(fixtureRuntime(), args, { stdio: ["pipe", "pipe", "pipe"] });
     const stdin = child.stdin;
     const stdout = child.stdout;
@@ -300,6 +310,111 @@ describe("cross-process optimistic concurrency", () => {
       await expect(second.onceExited).resolves.toBe(0);
       const ids = await persistedIds(path);
       expect([...ids].sort()).toEqual(["a", "b", "c"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given GC pauses before collecting a settled prefix, When a peer appends a higher-sequence operation and GC resumes, Then the appended operation survives", async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+      const collector = spawnStoreChild(path, "a", "pause-before-gc");
+      await collector.waitForMessage("held-before-gc");
+      const writer = spawnStoreChild(path, "b", "pause-after-op");
+      await writer.waitForMessage("held-after-op");
+
+      collector.stdin.end("resume\n");
+      await expect(collector.onceExited).resolves.toBe(0);
+      writer.stdin.end("resume\n");
+      await expect(writer.onceExited).resolves.toBe(0);
+
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b"]);
+    },
+    30_000,
+  );
+
+  test(
+    "Given a loader pauses after verifying a reconciliation compact, When two writers commit before its stale rename, Then replay restores both commits", async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+      const first = spawnStoreChild(path, "a", "pause-after-op");
+      await first.waitForMessage("held-after-op");
+      const loader = spawnStoreChild(path, "loader", "pause-after-verify", "load");
+      await loader.waitForMessage("held-after-verify");
+
+      first.stdin.end("resume\n");
+      await expect(first.onceExited).resolves.toBe(0);
+      const second = spawnStoreChild(path, "b");
+      await expect(second.onceExited).resolves.toBe(0);
+      loader.stdin.end("resume\n");
+      await expect(loader.onceExited).resolves.toBe(0);
+
+      expect([...(await persistedIds(path))].sort()).toEqual(["a", "b"]);
+    },
+    30_000,
+  );
+
+  test("Given a torn journal tail, When another mutation appends, Then writer-side framing preserves the new operation", async () => {
+    const dir = await tempDir();
+    const path = join(dir, "accounts.json");
+    const store = new AccountStore({ path, onWarning: () => undefined });
+    await store.add(account("a"));
+    await writeFile(`${path}.journal`, '{"type":"op"', { mode: 0o600 });
+
+    await store.add(account("b"));
+
+    expect((await store.load()).map((record) => record.id)).toEqual(["a", "b"]);
+  });
+
+  test("Given an arbitrary transform changes membership while toggling enabled, When it persists, Then it uses a compact and a true no-op writes no journal", async () => {
+    const dir = await tempDir();
+    const path = join(dir, "accounts.json");
+    const store = new AccountStore({ path });
+    await store.add(account("a"));
+    await store.add(account("b"));
+
+    await store.mutate((records) =>
+      records.map((record) =>
+        record.id === "a"
+          ? { ...record, enabled: false }
+          : { ...record, id: "c", token: "token-c" },
+      ),
+    );
+    expect((await store.load()).map((record) => record.id)).toEqual(["a", "c"]);
+    await store.mutate((records) => records.map((record) => ({ ...record })));
+    await expect(stat(`${path}.journal`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("Given a missing store beneath a nonexistent parent, When it loads, Then it returns empty without creating the parent", async () => {
+    const dir = await tempDir();
+    const parent = join(dir, "not-created");
+    const path = join(parent, "accounts.json");
+
+    await expect(new AccountStore({ path }).load()).resolves.toEqual([]);
+    await expect(stat(parent)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test(
+    "Given an add pauses before append, When a peer commits the same token under another id, Then the stale add rejects instead of reporting false success", async () => {
+      const dir = await tempDir();
+      const path = join(dir, "accounts.json");
+      const first = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-op",
+        "add",
+        "shared-token",
+      );
+      await first.waitForMessage("held-before-op");
+      const second = spawnStoreChild(path, "b", "normal", "add", "shared-token");
+      await expect(second.onceExited).resolves.toBe(0);
+
+      first.stdin.end("resume\n");
+      const failure = await first.waitForMessage("error");
+      expect(failure.name).toBe("AccountStoreError");
+      expect(failure.message).toBe("Account credential already exists");
+      await expect(first.onceExited).resolves.toBe(1);
+      await expect(persistedIds(path)).resolves.toEqual(["b"]);
     },
     30_000,
   );

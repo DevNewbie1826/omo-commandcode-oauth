@@ -26,12 +26,14 @@
 import { once } from "node:events";
 import { AccountStore } from "../../extensions/commandcode/accounts/store.ts";
 
-const [path, id, mode] = process.argv.slice(2);
+const [path, id, mode, action = "add", token = `token-${id}`, value = ""] = process.argv.slice(2);
 
 class ScheduledStore extends AccountStore {
   pausedOnce = false;
   captures = 0;
   heldWrite = false;
+  heldJournal = false;
+  heldGc = false;
 
   async pause(type, details = {}) {
     const resumed = once(process.stdin, "data", { signal: AbortSignal.timeout(30_000) });
@@ -59,24 +61,59 @@ class ScheduledStore extends AccountStore {
     return identity;
   }
 
-  async persistCas() {
+  async persistCas(...args) {
     if (mode === "conflict-forever") {
       // Every attempt reports a conflict, so the cycle can never land.
       return false;
     }
-    const landed = await super.persistCas(...arguments);
+    const landed = await super.persistCas(...args);
     if (mode === "pause-after-write" && landed && !this.heldWrite) {
       this.heldWrite = true;
       await this.pause("held-after-write");
     }
     return landed;
   }
+
+  async appendJournal(entry) {
+    if (mode === "pause-before-op" && entry.type === "op" && !this.heldJournal) {
+      this.heldJournal = true;
+      await this.pause("held-before-op");
+    }
+    await super.appendJournal(entry);
+    if (mode === "pause-after-op" && entry.type === "op" && !this.heldJournal) {
+      this.heldJournal = true;
+      await this.pause("held-after-op");
+    }
+  }
+
+  async replaceJournalWithEmpty() {
+    if (mode === "pause-before-gc" && !this.heldGc) {
+      this.heldGc = true;
+      await this.pause("held-before-gc");
+    }
+    await super.replaceJournalWithEmpty();
+  }
 }
 
 try {
-  const store = new ScheduledStore({ path });
-  await store.add({ id, token: `token-${id}` });
-  console.log(JSON.stringify({ type: "persisted", pid: process.pid, id }));
+  const store = new ScheduledStore({ path, now: () => 1_700_000_000_000 });
+  if (action === "load") await store.load();
+  else if (action === "add") await store.add({ id, token });
+  else if (action === "state") {
+    await store.mutate((records) =>
+      records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
+    );
+  } else {
+    throw new Error(`unknown fixture action: ${action}`);
+  }
+  console.log(
+    JSON.stringify({
+      type: "persisted",
+      pid: process.pid,
+      id,
+      ids: store.accounts().map((record) => record.id),
+    }),
+  );
 } catch (error) {
   console.log(
     JSON.stringify({
