@@ -416,6 +416,61 @@ describe("createFailoverStream", () => {
     expect(errorMessageOf(events)).toBe("mid-stream failure");
   });
 
+  it("Given account1 emits output then a terminal error event, When the wrapper streams, Then the error propagates without retry AND account1 is quarantined for future requests", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    const seen: string[] = [];
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+        seen.push(options?.apiKey ?? "");
+        return emit([
+          startEvent(),
+          errorEvent(
+            `429 ${JSON.stringify({
+              error: { code: "RATE_LIMITED", rateLimit: { window: "daily", reset: RESET_SECONDS } },
+            })}`,
+          ),
+        ]);
+      },
+    });
+
+    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
+
+    expect(seen).toEqual(["token-account1"]);
+    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+    const records = await store.load();
+    expect(records.find((record) => record.id === "account1")?.retryAt).toBe(RESET_SECONDS * 1000);
+    const next = await pool.next(clock.now());
+    expect(next.id).toBe("account2");
+  });
+
+  it("Given the adapter iterator throws after forwarding an event, When the wrapper streams, Then the thrown failure propagates without retry AND the account is quarantined", async () => {
+    const { store, pool, clock } = await setupPool(["account1", "account2"]);
+    const seen: string[] = [];
+    const streamSimple = failover({
+      pool,
+      clock,
+      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+        seen.push(options?.apiKey ?? "");
+        const inner = createAssistantMessageEventStream();
+        inner.push(startEvent());
+        inner.fail(retryAfterFailure());
+        return inner;
+      },
+    });
+
+    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
+
+    expect(seen).toEqual(["token-account1"]);
+    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+    expect(errorMessageOf(events)).toBe("rate limited");
+    const records = await store.load();
+    expect(records.find((record) => record.id === "account1")?.retryAt).toBe(BASE_MS + 30_000);
+    const next = await pool.next(clock.now());
+    expect(next.id).toBe("account2");
+  });
+
   it("Given every account is rate-limited, When the wrapper streams, Then the outer stream fails with a NoHealthyAccounts message containing the reset ISO", async () => {
     const { pool, clock } = await setupPool(["account1", "account2"]);
     const streamSimple = failover({
