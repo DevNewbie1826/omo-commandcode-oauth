@@ -6,9 +6,9 @@
  * collection to distinguish stale publications from later operations.
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   ACCOUNTS_FILE_VERSION,
   AccountStoreError,
@@ -81,7 +81,7 @@ type JournalEntryDraft =
   | { readonly type: "abort"; readonly id: string };
 
 interface JournalSnapshot {
-  readonly contents: string;
+  readonly liveContents: string;
   readonly entries: readonly JournalEntry[];
 }
 
@@ -198,6 +198,7 @@ export class AccountStore {
   private records: readonly AccountRecord[] = [];
   private writeTail: Promise<unknown> = Promise.resolve();
   private readonly clock: () => number;
+  private readonly warnedJournalLines = new Set<string>();
   private lastReadAppliedSeq = 0;
   private lastReadExists = false;
 
@@ -441,61 +442,14 @@ export class AccountStore {
   protected async replaceJournalWithEmpty(): Promise<void> {
     for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
       const collected = await this.withJournalLock(async () => {
-        const identity = await this.captureIdentity();
-        const disk = await this.readDiskSnapshotDirect();
         const journal = await this.readJournal();
-        if (journal.entries.length === 0) return true;
-        const committed = new Set(
-          journal.entries.flatMap((entry) => entry.type === "commit" ? [entry.id] : []),
-        );
-        const aborted = new Set(
-          journal.entries.flatMap((entry) => entry.type === "abort" ? [entry.id] : []),
-        );
-        const collectableIds = new Set<string>();
-        for (const entry of journal.entries) {
-          if (entry.type !== "op" || entry.seq === undefined) continue;
-          const publishedCommit =
-            committed.has(entry.id) && entry.seq <= disk.lastAppliedSeq;
-          if (!publishedCommit && !aborted.has(entry.id)) break;
-          collectableIds.add(entry.id);
+        if (journal.liveContents.length > 0) {
+          const liveEntries = await this.parseJournalContentsWithoutWarnings(journal.liveContents);
+          const archiveMaximum = this.maximumSequence(liveEntries, 0);
+          if (!(await this.rotateLiveJournal(journal.liveContents, archiveMaximum))) return false;
         }
-        const retained = journal.entries.filter((entry) => !collectableIds.has(entry.id));
-        if (collectableIds.size === 0) return true;
-        const journalTemporaryPath = `${this.journalPath()}.${process.pid}.${randomUUID()}.tmp`;
-        try {
-          if (retained.length > 0) {
-            const contents = `${retained.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-            await writeFile(journalTemporaryPath, contents, {
-              encoding: "utf-8",
-              flag: "wx",
-              mode: 0o600,
-            });
-          }
-
-          const ownsPublication = disk.exists
-            ? await this.persistCas(
-              identity,
-              serializeAccountFile(disk.records, disk.lastAppliedSeq),
-            )
-            : this.sameIdentity(identity, await this.captureIdentity());
-          if (!ownsPublication || await this.readJournalContents() !== journal.contents) {
-            await this.removeTemporary(journalTemporaryPath);
-            return false;
-          }
-
-          if (retained.length === 0) {
-            await rm(this.journalPath(), { force: true });
-          } else {
-            await rename(journalTemporaryPath, this.journalPath());
-          }
-        } catch (error) {
-          await this.removeTemporary(journalTemporaryPath, error);
-          throw new AccountStoreError(
-            `Could not garbage-collect accounts journal at ${this.journalPath()}`,
-            { cause: error },
-          );
-        }
-        await this.removeTemporary(journalTemporaryPath);
+        await this.retireLiveJournal();
+        await this.deleteDeadArchives();
         return true;
       });
       if (collected) return;
@@ -505,37 +459,178 @@ export class AccountStore {
     );
   }
 
-  private async readJournal(): Promise<JournalSnapshot> {
-    const contents = await this.readJournalContents();
-    const entries: JournalEntry[] = [];
-    const lines = contents.split("\n");
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      if (line === undefined || line.length === 0) continue;
-      try {
-        const parsed: unknown = JSON.parse(line);
-        entries.push(parseJournalEntry(parsed));
-      } catch (error) {
-        this.warn(
-          new AccountStoreJournalWarning(
-            `Ignored malformed accounts journal line ${index + 1} at ${this.journalPath()}`,
-            { cause: error },
-          ),
-        );
-      }
-    }
-    return { contents, entries };
-  }
-
-  private async readJournalContents(): Promise<string> {
+  protected async rotateLiveJournal(
+    expectedContents: string,
+    maximumSequence: number,
+  ): Promise<boolean> {
+    if (await this.readJournalContents() !== expectedContents) return false;
+    const archivePath = `${this.journalPath()}.archive-${String(maximumSequence).padStart(16, "0")}-${Date.now()}-${randomUUID()}`;
     try {
-      return await readFile(this.journalPath(), "utf-8");
+      await rename(this.journalPath(), archivePath);
     } catch (error) {
-      if (hasErrorCode(error, "ENOENT")) return "";
-      throw new AccountStoreError(`Could not read accounts journal at ${this.journalPath()}`, {
+      if (hasErrorCode(error, "ENOENT")) return false;
+      throw new AccountStoreError(`Could not rotate accounts journal at ${this.journalPath()}`, {
         cause: error,
       });
     }
+
+    try {
+      const handle = await open(this.journalPath(), "wx", 0o600);
+      try {
+        await handle.chmod(0o600);
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      if (!hasErrorCode(error, "EEXIST")) {
+        throw new AccountStoreError(`Could not create accounts journal at ${this.journalPath()}`, {
+          cause: error,
+        });
+      }
+    }
+    return true;
+  }
+
+  private async retireLiveJournal(): Promise<void> {
+    const contents = await this.readJournalFile(this.journalPath());
+    if (contents === undefined) return;
+    const entries = await this.parseJournalContentsWithoutWarnings(contents);
+    const maximumSequence = this.maximumSequence(entries, 0);
+    const archivePath = `${this.journalPath()}.archive-${String(maximumSequence).padStart(16, "0")}-${Date.now()}-${randomUUID()}`;
+    try {
+      // A second rename retires the newly-created empty live journal without
+      // unlinking it. If a stale-lock peer appended in the meantime, those
+      // bytes move intact into this archive instead of being discarded.
+      await rename(this.journalPath(), archivePath);
+    } catch (error) {
+      if (!hasErrorCode(error, "ENOENT")) {
+        throw new AccountStoreError(`Could not retire accounts journal at ${this.journalPath()}`, {
+          cause: error,
+        });
+      }
+    }
+  }
+
+  private async deleteDeadArchives(): Promise<void> {
+    const snapshots: {
+      readonly path: string;
+      readonly entries: readonly JournalEntry[];
+      readonly maximumSequence: number;
+      readonly locallySettled: boolean;
+    }[] = [];
+    for (const archivePath of await this.journalArchivePaths()) {
+      const contents = await this.readJournalFile(archivePath);
+      if (contents === undefined) continue;
+      const entries = await this.parseJournalContentsWithoutWarnings(contents);
+      const settled = new Set(
+        entries.flatMap((entry) => entry.type === "commit" || entry.type === "abort" ? [entry.id] : []),
+      );
+      snapshots.push({
+        path: archivePath,
+        entries,
+        maximumSequence: this.maximumSequence(entries, 0),
+        locallySettled: entries.every((entry) => entry.type !== "op" || settled.has(entry.id)),
+      });
+    }
+
+    // A split operation/commit marks an owner that may still resume a stale
+    // mutation rename. Preserve the two newest archive ranges as its recovery
+    // fence; otherwise settled archives can be collected immediately.
+    const retained = snapshots.some((snapshot) => !snapshot.locallySettled)
+      ? new Set(snapshots.slice(-2).map((snapshot) => snapshot.path))
+      : new Set<string>();
+    for (const snapshot of snapshots) {
+      if (retained.has(snapshot.path)) continue;
+      // This is the only archive-deletion predicate: both operands are read
+      // fresh from immutable archive bytes and the current accounts file.
+      const currentDisk = await this.readDiskSnapshotDirect();
+      if (snapshot.maximumSequence > currentDisk.lastAppliedSeq) continue;
+      try {
+        await rm(snapshot.path);
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw new AccountStoreError(`Could not delete accounts journal archive at ${snapshot.path}`, {
+            cause: error,
+          });
+        }
+      }
+    }
+  }
+
+  private async readJournal(): Promise<JournalSnapshot> {
+    // Read the live file before listing archives. If rotation races this read,
+    // the old contents are observed either here or under their new archive
+    // name (possibly both), but can never fall through the gap between them.
+    const liveContents = await this.readJournalContents();
+    const archivePaths = await this.journalArchivePaths();
+    const snapshots: { readonly path: string; readonly contents: string }[] = [];
+    for (const archivePath of archivePaths) {
+      const contents = await this.readJournalFile(archivePath);
+      if (contents !== undefined) snapshots.push({ path: archivePath, contents });
+    }
+    snapshots.push({ path: this.journalPath(), contents: liveContents });
+
+    const entries: JournalEntry[] = [];
+    for (const snapshot of snapshots) {
+      const lines = snapshot.contents.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        if (line === undefined || line.length === 0) continue;
+        try {
+          const parsed: unknown = JSON.parse(line);
+          entries.push(parseJournalEntry(parsed));
+        } catch (error) {
+          const warningKey = `${snapshot.path}:${index + 1}:${line}`;
+          if (!this.warnedJournalLines.has(warningKey)) {
+            this.warnedJournalLines.add(warningKey);
+            this.warn(
+              new AccountStoreJournalWarning(
+                `Ignored malformed accounts journal line ${index + 1} at ${snapshot.path}`,
+                { cause: error },
+              ),
+            );
+          }
+        }
+      }
+    }
+    entries.sort((left, right) => {
+      const leftSequence = left.type === "op" ? left.seq ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+      const rightSequence = right.type === "op" ? right.seq ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+      return leftSequence - rightSequence;
+    });
+    return { liveContents, entries };
+  }
+
+  private async readJournalContents(): Promise<string> {
+    const contents = await this.readJournalFile(this.journalPath());
+    return contents ?? "";
+  }
+
+  private async readJournalFile(path: string): Promise<string | undefined> {
+    try {
+      return await readFile(path, "utf-8");
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return undefined;
+      throw new AccountStoreError(`Could not read accounts journal at ${path}`, { cause: error });
+    }
+  }
+
+  private async journalArchivePaths(): Promise<string[]> {
+    const journalPath = this.journalPath();
+    const prefix = `${basename(journalPath)}.archive-`;
+    let names: string[];
+    try {
+      names = await readdir(dirname(journalPath));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw new AccountStoreError(`Could not list accounts journal archives at ${journalPath}`, {
+        cause: error,
+      });
+    }
+    return names
+      .filter((name) => name.startsWith(prefix))
+      .sort()
+      .map((name) => join(dirname(journalPath), name));
   }
 
   protected async appendJournal(entry: JournalEntryDraft): Promise<void> {

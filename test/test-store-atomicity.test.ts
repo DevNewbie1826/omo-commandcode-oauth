@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Interface as ReadlineInterface } from "node:readline";
 import { createInterface } from "node:readline";
@@ -29,6 +29,23 @@ async function tempDir(): Promise<string> {
 
 function account(id: string, token: string = `token-${id}`): AccountRecordInput {
   return { id, token };
+}
+
+async function journalLines(accountsPath: string): Promise<string[]> {
+  const journalName = `${basename(accountsPath)}.journal`;
+  const names = (await readdir(dirname(accountsPath)))
+    .filter((name) => name === journalName || name.startsWith(`${journalName}.archive-`));
+  const contents = await Promise.all(
+    names.map((name) => readFile(join(dirname(accountsPath), name), "utf-8")),
+  );
+  return contents.flatMap((content) => content.split("\n").filter((line) => line.length > 0));
+}
+
+async function expectNoTransientResidue(directory: string): Promise<void> {
+  const transient = (await readdir(directory)).filter(
+    (name) => name.endsWith(".lock") || name.endsWith(".tmp") || name.endsWith(".stale"),
+  );
+  expect(transient).toEqual([]);
 }
 
 /** One JSON protocol line from the pausable-store child fixture. */
@@ -78,9 +95,10 @@ describe("cross-process atomicity", () => {
     const planted = await stat(legacyTemp);
     expect(planted.mode & 0o777).toBe(0o644);
     await expect(readFile(legacyTemp, "utf-8")).resolves.toBe("stale");
-    expect((await readdir(dir)).sort()).toEqual(
-      ["accounts.json", `accounts.json.${process.pid}.tmp`].sort(),
-    );
+    const files = await readdir(dir);
+    expect(files).toContain("accounts.json");
+    expect(files).toContain(`accounts.json.${process.pid}.tmp`);
+    expect(files.filter((name) => name.endsWith(".lock"))).toEqual([]);
     const records = await new AccountStore({ path }).load();
     expect(records.map((record) => record.id)).toEqual(["a"]);
   });
@@ -214,9 +232,9 @@ describe("cross-process optimistic concurrency", () => {
 
       const ids = await persistedIds(path);
       expect([...ids].sort()).toEqual(["a", "b"]);
-      // No lock-file machinery or abandoned temp files; the fully
-      // garbage-collected journal has also been removed.
-      await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
+      // Rotation may retain bounded journal archives, but no lock or
+      // temporary publication artifact survives the completed mutation.
+      await expectNoTransientResidue(dir);
     },
     30_000,
   );
@@ -247,7 +265,7 @@ describe("cross-process optimistic concurrency", () => {
 
       const ids = await persistedIds(path);
       expect([...ids].sort()).toEqual(["a", "b", "c"]);
-      await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
+      await expectNoTransientResidue(dir);
     },
     30_000,
   );
@@ -281,7 +299,7 @@ describe("cross-process optimistic concurrency", () => {
       // The externally-written credential survived A's stale write attempt.
       const finalContents = await readFile(path, "utf-8");
       expect(finalContents).toContain("token-ext");
-      await expect(readdir(dir)).resolves.toEqual(["accounts.json"]);
+      await expectNoTransientResidue(dir);
     },
     30_000,
   );
@@ -396,8 +414,9 @@ describe("cross-process optimistic concurrency", () => {
       ),
     );
     expect((await store.load()).map((record) => record.id)).toEqual(["a", "c"]);
+    const beforeNoOp = await journalLines(path);
     await store.mutate((records) => records.map((record) => ({ ...record })));
-    await expect(stat(`${path}.journal`)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await journalLines(path)).toEqual(beforeNoOp);
   });
 
   test("Given a missing store beneath a nonexistent parent, When it loads, Then it returns empty without creating the parent", async () => {
@@ -656,6 +675,35 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
+    "Given a GC owner reaches the rotation decision and loses its default lease, When a peer commits and collects its journal before the owner resumes, Then GC never regresses the accounts snapshot or watermark",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "gc-rotation-boundary.json");
+      const owner = spawnStoreChild(path, "a", "pause-before-gc-rotation");
+      await owner.waitForMessage("held-before-gc-rotation");
+      const lockBefore = await stat(`${path}.journal.lock`);
+      owner.signal("SIGSTOP");
+
+      const peer = spawnStoreChild(path, "b");
+      await expect(peer.onceExited).resolves.toBe(0);
+      const acknowledged = parseAccountFile(JSON.parse(await readFile(path, "utf-8")));
+      expect(acknowledged.accounts.map((record) => record.id)).toEqual(["a", "b"]);
+      expect(acknowledged.lastAppliedSeq).toBe(4);
+      expect(Date.now() - lockBefore.mtimeMs).toBeGreaterThanOrEqual(15_000);
+
+      owner.signal("SIGCONT");
+      owner.stdin.end("resume\n");
+      await expect(owner.onceExited).resolves.toBe(0);
+
+      const after = parseAccountFile(JSON.parse(await readFile(path, "utf-8")));
+      expect(after.accounts.map((record) => record.id)).toEqual(["a", "b"]);
+      expect(after.lastAppliedSeq).toBe(4);
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b"]);
+    },
+    35_000,
+  );
+
+  test(
     "Given a settled journal prefix is followed by an abandoned operation, When GC runs, Then it collects the prefix without deleting the later pending append",
     async () => {
       const dir = await tempDir();
@@ -669,17 +717,15 @@ describe("cross-process optimistic concurrency", () => {
 
       collector.stdin.end("resume\n");
       await expect(collector.onceExited).resolves.toBe(0);
-      const retained = (await readFile(`${path}.journal`, "utf-8"))
-        .split("\n")
-        .filter((line) => line.length > 0);
-      expect(retained).toHaveLength(1);
+      const retained = (await journalLines(path)).map((line) => JSON.parse(line) as ChildMessage);
+      expect(retained).toContainEqual(expect.objectContaining({ type: "op" }));
       await expect(persistedIds(path)).resolves.toEqual(["settled", "pending"]);
     },
     30_000,
   );
 
   test(
-    "Given sequential operations fully reconcile, When the mutation returns, Then journal GC leaves an empty protected journal",
+    "Given sequential operations fully reconcile, When the mutation returns, Then journal GC leaves no live journal and only bounded archives",
     async () => {
       const dir = await tempDir();
       const path = join(dir, "accounts.json");
@@ -690,6 +736,8 @@ describe("cross-process optimistic concurrency", () => {
       await store.remove("a");
 
       await expect(stat(`${path}.journal`)).rejects.toMatchObject({ code: "ENOENT" });
+      const archives = (await readdir(dir)).filter((name) => name.includes(".journal.archive-"));
+      expect(archives.length).toBeLessThanOrEqual(2);
     },
   );
 
@@ -723,9 +771,11 @@ describe("cross-process optimistic concurrency", () => {
       expect(failure.message).toMatch(/concurrent/i);
       await expect(child.onceExited).resolves.toBe(1);
 
-      // No successful account write landed and every attempt cleaned up; the
-      // aborted operation and its journal were fully GC'd.
-      await expect(readdir(dir)).resolves.toEqual([]);
+      // No successful account write landed and every attempt cleaned up its
+      // lock and temporary publication artifacts. Rotation may retain the
+      // aborted operation in a bounded archive.
+      await expectNoTransientResidue(dir);
+      await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
     },
     30_000,
   );

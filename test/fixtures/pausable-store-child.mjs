@@ -38,6 +38,7 @@ class ScheduledStore extends AccountStore {
   heldGc = false;
   inGc = false;
   heldGcSnapshot = false;
+  heldGcRotation = false;
 
   async pause(type, details = {}) {
     const resumed = once(process.stdin, "data", { signal: AbortSignal.timeout(30_000) });
@@ -122,6 +123,14 @@ class ScheduledStore extends AccountStore {
       await this.pause("held-in-gc-after-journal-read", { entries: snapshot.entries.length });
     }
     return snapshot;
+  }
+
+  async rotateLiveJournal(...args) {
+    if (modes.has("pause-before-gc-rotation") && !this.heldGcRotation) {
+      this.heldGcRotation = true;
+      await this.pause("held-before-gc-rotation");
+    }
+    return super.rotateLiveJournal(...args);
   }
 
   async withJournalLock(task) {
