@@ -237,7 +237,7 @@ interface ChangedRecordEffect {
 }
 
 interface StateEffect {
-  readonly addedIds: readonly string[];
+  readonly added: readonly AccountRecord[];
   readonly removedIds: readonly string[];
   readonly changed: readonly ChangedRecordEffect[];
 }
@@ -294,13 +294,13 @@ function describeStateEffect(
 ): StateEffect {
   const baseById = new Map(base.map((record) => [record.id, record]));
   const intendedById = new Map(intended.map((record) => [record.id, record]));
-  const addedIds: string[] = [];
+  const added: AccountRecord[] = [];
   const changed: ChangedRecordEffect[] = [];
 
   for (const record of intended) {
     const baseRecord = baseById.get(record.id);
     if (baseRecord === undefined) {
-      addedIds.push(record.id);
+      added.push(record);
       continue;
     }
     const leaves = ACCOUNT_RECORD_LEAVES.filter(
@@ -310,7 +310,7 @@ function describeStateEffect(
   }
 
   return {
-    addedIds,
+    added,
     removedIds: base.filter((record) => !intendedById.has(record.id)).map((record) => record.id),
     changed,
   };
@@ -319,13 +319,79 @@ function describeStateEffect(
 function stateEffectPresent(records: readonly AccountRecord[], effect: StateEffect): boolean {
   const currentById = new Map(records.map((record) => [record.id, record]));
   if (effect.removedIds.some((id) => currentById.has(id))) return false;
-  if (effect.addedIds.some((id) => !currentById.has(id))) return false;
+  if (effect.added.some((record) => !currentById.has(record.id))) return false;
   return effect.changed.every((change) => {
     const current = currentById.get(change.id);
     return current !== undefined && change.leaves.every(
       (leaf) => sameRecordLeaf(current, change.intended, leaf),
     );
   });
+}
+
+function anyStateEffectPresent(records: readonly AccountRecord[], effect: StateEffect): boolean {
+  const currentById = new Map(records.map((record) => [record.id, record]));
+  if (effect.removedIds.some((id) => !currentById.has(id))) return true;
+  if (effect.added.some((record) => currentById.has(record.id))) return true;
+  return effect.changed.some((change) => {
+    const current = currentById.get(change.id);
+    return current !== undefined && change.leaves.some(
+      (leaf) => sameRecordLeaf(current, change.intended, leaf),
+    );
+  });
+}
+
+function repairChangedRecord(
+  current: AccountRecord,
+  change: ChangedRecordEffect,
+): AccountRecord {
+  const leaves = new Set(change.leaves);
+  const intended = change.intended;
+  const creditChanged = change.leaves.some((leaf) => leaf.startsWith("credits."));
+  let credits = current.credits;
+  if (creditChanged) {
+    if (intended.credits === undefined || current.credits === undefined) {
+      credits = intended.credits;
+    } else {
+      credits = {
+        monthly: leaves.has("credits.monthly") ? intended.credits.monthly : current.credits.monthly,
+        purchased: leaves.has("credits.purchased")
+          ? intended.credits.purchased
+          : current.credits.purchased,
+        free: leaves.has("credits.free") ? intended.credits.free : current.credits.free,
+        periodEnd: leaves.has("credits.periodEnd")
+          ? intended.credits.periodEnd
+          : current.credits.periodEnd,
+      };
+    }
+  }
+  return {
+    ...current,
+    token: leaves.has("token") ? intended.token : current.token,
+    userId: leaves.has("userId") ? intended.userId : current.userId,
+    userName: leaves.has("userName") ? intended.userName : current.userName,
+    keyName: leaves.has("keyName") ? intended.keyName : current.keyName,
+    enabled: leaves.has("enabled") ? intended.enabled : current.enabled,
+    retryAt: leaves.has("retryAt") ? intended.retryAt : current.retryAt,
+    createdAt: leaves.has("createdAt") ? intended.createdAt : current.createdAt,
+    credits,
+  };
+}
+
+function repairStateEffect(
+  records: readonly AccountRecord[],
+  effect: StateEffect,
+): readonly AccountRecord[] {
+  const removed = new Set(effect.removedIds);
+  const changes = new Map(effect.changed.map((change) => [change.id, change]));
+  const repaired = records
+    .filter((record) => !removed.has(record.id))
+    .map((record) => {
+      const change = changes.get(record.id);
+      return change === undefined ? record : repairChangedRecord(record, change);
+    });
+  const currentIds = new Set(repaired.map((record) => record.id));
+  const additions = effect.added.filter((record) => !currentIds.has(record.id));
+  return [...repaired, ...additions];
 }
 
 function applyNarrowOperation(
@@ -428,7 +494,7 @@ export class AccountStore {
   async mutate(
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
-    let effect: StateEffect = { addedIds: [], removedIds: [], changed: [] };
+    let effect: StateEffect = { added: [], removedIds: [], changed: [] };
     await this.update(
       (records, baseLastAppliedSeq) => {
         const intended = transform(records);
@@ -439,6 +505,13 @@ export class AccountStore {
           : { kind: "state", records: intended, baseLastAppliedSeq };
       },
       (records) => stateEffectPresent(records, effect),
+      (records, baseLastAppliedSeq) => {
+        const repaired = repairStateEffect(records, effect);
+        return sameRecords(records, repaired)
+          ? null
+          : { kind: "state", records: repaired, baseLastAppliedSeq };
+      },
+      (records) => anyStateEffectPresent(records, effect),
     );
   }
 
@@ -448,12 +521,30 @@ export class AccountStore {
       baseLastAppliedSeq: number,
     ) => StoreOperation | null,
     effectPresent: (records: readonly AccountRecord[]) => boolean,
+    repairAppliedEffect?: (
+      records: readonly AccountRecord[],
+      baseLastAppliedSeq: number,
+    ) => StoreOperation | null,
+    anyEffectPresent: (records: readonly AccountRecord[]) => boolean = effectPresent,
   ): Promise<void> {
     await this.exclusive(() =>
       exclusiveAcrossInstances(async () => {
+        let operationFactory = createOperation;
         for (let attempt = 1; attempt <= MAX_MUTATION_ATTEMPTS; attempt += 1) {
-          const result = await this.persistOperation(createOperation);
-          if (result.disposition === "complete" || result.disposition === "applied") return;
+          const result = await this.persistOperation(operationFactory);
+          if (result.disposition === "complete") return;
+          if (result.disposition === "applied") {
+            if (effectPresent(result.records)) return;
+            // If every changed leaf was subsequently erased, preserve the
+            // accepted OCC retry contract without invoking a non-idempotent
+            // transform twice. A partially retained effect is application
+            // evidence and later overlapping writes remain last-writer-wins.
+            if (repairAppliedEffect !== undefined && !anyEffectPresent(result.records)) {
+              operationFactory = repairAppliedEffect;
+              continue;
+            }
+            return;
+          }
           if (result.disposition === "rejected-duplicate") {
             if (effectPresent(result.records)) return;
             throw new AccountStoreError("Account credential already exists");

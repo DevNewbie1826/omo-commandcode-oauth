@@ -938,6 +938,37 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
+    "Given a state setter pauses before linking and a later setter fully overwrites it, When the first setter resumes, Then it repairs its erased effect without re-running unrelated transform work",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "fully-erased-applied-state.json");
+      await new AccountStore({ path }).add(account("a"));
+
+      const first = spawnStoreChild(
+        path,
+        "a",
+        "pause-after-verify",
+        "state",
+        "token-a",
+        "first",
+      );
+      await first.waitForMessage("held-after-verify");
+      const second = spawnStoreChild(path, "a", "normal", "state", "token-a", "second");
+      await expect(second.onceExited).resolves.toBe(0);
+      expect((await new AccountStore({ path }).load())[0]?.keyName).toBe("second");
+
+      const persisted = first.waitForMessage("persisted");
+      first.stdin.end("resume\n");
+      await expect(persisted).resolves.toMatchObject({ ids: ["a"], transformCalls: 1 });
+      await expect(first.onceExited).resolves.toBe(0);
+      const loaded = await new AccountStore({ path }).load();
+      expect(loaded[0]?.keyName).toBe("first");
+      await expect(new AccountStore({ path }).load()).resolves.toEqual(loaded);
+    },
+    30_000,
+  );
+
+  test(
     "Given a state mutation is skipped as older than a peer compact, When publication reconciles, Then the mutation retries until its keyName effect is present",
     async () => {
       const dir = await tempDir();

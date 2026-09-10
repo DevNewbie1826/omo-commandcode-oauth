@@ -206,9 +206,10 @@ try {
   else if (action === "add-json") await store.add(JSON.parse(value));
   else if (action === "enable") await store.setEnabled(id, value === "true");
   else if (action === "state") {
-    await store.mutate((records) =>
-      records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),
-    );
+    await store.mutate((records) => {
+      transformCalls += 1;
+      return records.map((record) => (record.id === id ? { ...record, keyName: value } : record));
+    });
   } else if (
     ["increment", "toggle", "multi", "saturate", "reordered-increment", "free", "add-and-increment"].includes(action)
   ) {
