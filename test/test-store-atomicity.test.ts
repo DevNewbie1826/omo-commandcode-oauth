@@ -324,6 +324,35 @@ describe("cross-process optimistic concurrency", () => {
   );
 
   test(
+    "Given an ordinary publisher is parked at its final identity boundary, When four acknowledged peers publish and collect before it resumes, Then its stale version cannot erase any account and a later add also survives",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "five-writer-version-fence.json");
+      const parked = spawnStoreChild(path, "a", "pause-after-verify");
+      await parked.waitForMessage("held-after-verify");
+      parked.signal("SIGSTOP");
+
+      for (const id of ["b", "c", "d", "e"]) {
+        const peer = spawnStoreChild(path, id);
+        await expect(peer.onceExited).resolves.toBe(0);
+        await expect(persistedIds(path)).resolves.toEqual([
+          "a",
+          ...["b", "c", "d", "e"].slice(0, ["b", "c", "d", "e"].indexOf(id) + 1),
+        ]);
+      }
+
+      parked.signal("SIGCONT");
+      parked.stdin.end("resume\n");
+      await expect(parked.onceExited).resolves.toBe(0);
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b", "c", "d", "e"]);
+
+      await new AccountStore({ path }).add(account("later"));
+      await expect(persistedIds(path)).resolves.toEqual(["a", "b", "c", "d", "e", "later"]);
+    },
+    30_000,
+  );
+
+  test(
     "Given A publishes while B holds a verified stale identity, When C commits before B resumes, Then reconciliation preserves a, b, AND c",
     async () => {
       const dir = await tempDir();
@@ -480,7 +509,9 @@ describe("cross-process optimistic concurrency", () => {
       loader.stdin.write("resume\n");
       await loader.waitForMessage("held-after-state");
       await expect(persistedIds(path)).resolves.toEqual(["seed", "p", "b"]);
+      const loaderPersisted = loader.waitForMessage("persisted");
       loader.stdin.end("resume\n");
+      await expect(loaderPersisted).resolves.toMatchObject({ type: "persisted" });
       await expect(loader.onceExited).resolves.toBe(0);
       expect([...(await persistedIds(path))].sort()).toEqual(["b", "p", "seed"]);
     },

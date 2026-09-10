@@ -1,14 +1,17 @@
-/*
- * `AccountStore` uses an append-only write-ahead journal plus identity-CAS
- * publication. Every operation and every derived-state publication receives
- * a monotonically increasing sequence number. The accounts file records the
- * highest sequence incorporated by its snapshot, allowing replay and journal
- * collection to distinguish stale publications from later operations.
+/* SIZE_OK: journal recovery, publication, and OCC stay colocated so subclasses
+ * can exercise the real persistence seams without a parallel test model.
+ *
+ * `AccountStore` uses an append-only write-ahead journal plus immutable,
+ * sequence-named state publications. The highest accounts.v<seq>.json file is
+ * authoritative, so a delayed writer can publish only an older version, never
+ * replace newer state. The canonical accounts path is a best-effort mirror for
+ * humans and legacy tooling; correctness never depends on it once a version
+ * file exists.
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import {
   ACCOUNTS_FILE_VERSION,
   AccountStoreError,
@@ -49,6 +52,7 @@ const MAX_MUTATION_ATTEMPTS = 4;
 const DEFAULT_JOURNAL_LOCK_STALE_MS = 15_000;
 const MAX_JOURNAL_LOCK_ATTEMPTS = 10_000;
 const JOURNAL_LOCK_RETRY_MS = 2;
+const VERSION_RETENTION_DISTANCE = 5;
 
 type FileIdentity =
   | { readonly kind: "missing" }
@@ -89,6 +93,12 @@ interface DiskSnapshot {
   readonly records: readonly AccountRecord[];
   readonly lastAppliedSeq: number;
   readonly exists: boolean;
+}
+
+interface VersionSnapshot extends DiskSnapshot {
+  readonly name: string;
+  readonly path: string;
+  readonly publicationSeq: number;
 }
 
 let processCycleTail: Promise<unknown> = Promise.resolve();
@@ -445,13 +455,15 @@ export class AccountStore {
           id: compactId,
           operation: { kind: "state", baseLastAppliedSeq: compactBase, records: replayed },
         });
+        disk = await this.readDiskSnapshot();
         const withCompact = await this.readJournal();
-        const compactSeq = this.operationSequence(withCompact.entries, compactId);
-        const publishRecords = this.replay(
-          disk.records,
-          withCompact.entries,
-          disk.lastAppliedSeq,
+        const compact = withCompact.entries.find(
+          (entry) => entry.type === "op" && entry.id === compactId,
         );
+        if (compact === undefined || compact.type !== "op" || compact.seq === undefined) continue;
+        const compactSeq = compact.seq;
+        if (disk.lastAppliedSeq >= compactSeq) continue;
+        const publishRecords = this.replay(disk.records, withCompact.entries, disk.lastAppliedSeq);
         if (await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq))) {
           await this.appendJournal({ type: "commit", id: compactId });
           await this.appendJournal({ type: "commit", id: operationId });
@@ -523,9 +535,19 @@ export class AccountStore {
           records: replayed,
         },
       });
+      const refreshedDisk = await this.readDiskSnapshot();
       const withCompact = await this.readJournal();
-      const compactSeq = this.operationSequence(withCompact.entries, compactId);
-      const publishRecords = this.replay(disk.records, withCompact.entries, disk.lastAppliedSeq);
+      const compact = withCompact.entries.find(
+        (entry) => entry.type === "op" && entry.id === compactId,
+      );
+      if (compact === undefined || compact.type !== "op" || compact.seq === undefined) continue;
+      const compactSeq = compact.seq;
+      if (refreshedDisk.lastAppliedSeq >= compactSeq) continue;
+      const publishRecords = this.replay(
+        refreshedDisk.records,
+        withCompact.entries,
+        refreshedDisk.lastAppliedSeq,
+      );
       if (!(await this.persistCas(identity, serializeAccountFile(publishRecords, compactSeq)))) {
         await this.appendJournal({ type: "abort", id: compactId });
         continue;
@@ -554,6 +576,7 @@ export class AccountStore {
         }
         await this.retireLiveJournal();
         await this.deleteDeadArchives();
+        await this.deleteOldVersions();
         return true;
       });
       if (collected) return;
@@ -616,44 +639,41 @@ export class AccountStore {
   }
 
   private async deleteDeadArchives(): Promise<void> {
-    const snapshots: {
-      readonly path: string;
-      readonly entries: readonly JournalEntry[];
-      readonly maximumSequence: number;
-      readonly locallySettled: boolean;
-    }[] = [];
     for (const archivePath of await this.journalArchivePaths()) {
       const contents = await this.readJournalFile(archivePath);
       if (contents === undefined) continue;
       const entries = await this.parseJournalContentsWithoutWarnings(contents);
-      const settled = new Set(
-        entries.flatMap((entry) => entry.type === "commit" || entry.type === "abort" ? [entry.id] : []),
-      );
-      snapshots.push({
-        path: archivePath,
-        entries,
-        maximumSequence: this.maximumSequence(entries, 0),
-        locallySettled: entries.every((entry) => entry.type !== "op" || settled.has(entry.id)),
-      });
-    }
-
-    // A split operation/commit marks an owner that may still resume a stale
-    // mutation rename. Preserve the two newest archive ranges as its recovery
-    // fence; otherwise settled archives can be collected immediately.
-    const retained = snapshots.some((snapshot) => !snapshot.locallySettled)
-      ? new Set(snapshots.slice(-2).map((snapshot) => snapshot.path))
-      : new Set<string>();
-    for (const snapshot of snapshots) {
-      if (retained.has(snapshot.path)) continue;
-      // This is the only archive-deletion predicate: both operands are read
-      // fresh from immutable archive bytes and the current accounts file.
-      const currentDisk = await this.readDiskSnapshotDirect();
-      if (snapshot.maximumSequence > currentDisk.lastAppliedSeq) continue;
+      const archiveMaximum = this.maximumSequence(entries, 0);
+      // Keep the disk-read seam at the deletion decision so process tests can
+      // race the real boundary after the publication mechanism moved.
+      await this.readDiskSnapshotDirect();
+      // Recovery bytes are disposable only after a freshly selected immutable
+      // authority has absorbed their complete sequence range.
+      const authority = await this.readAuthoritativeVersionSnapshot();
+      if (authority === undefined || archiveMaximum > authority.publicationSeq) continue;
       try {
-        await rm(snapshot.path);
+        await rm(archivePath);
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
-          throw new AccountStoreError(`Could not delete accounts journal archive at ${snapshot.path}`, {
+          throw new AccountStoreError(`Could not delete accounts journal archive at ${archivePath}`, {
+            cause: error,
+          });
+        }
+      }
+    }
+  }
+
+  private async deleteOldVersions(): Promise<void> {
+    const authority = await this.readAuthoritativeVersionSnapshot();
+    if (authority === undefined) return;
+    const floor = Math.max(0, authority.publicationSeq - VERSION_RETENTION_DISTANCE);
+    for (const candidate of await this.versionCandidates()) {
+      if (candidate.publicationSeq >= floor) continue;
+      try {
+        await rm(candidate.path);
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) {
+          throw new AccountStoreError(`Could not delete old accounts version at ${candidate.path}`, {
             cause: error,
           });
         }
@@ -787,14 +807,6 @@ export class AccountStore {
     );
   }
 
-  private operationSequence(entries: readonly JournalEntry[], id: string): number {
-    const operation = entries.find((entry) => entry.type === "op" && entry.id === id);
-    if (operation === undefined || operation.type !== "op" || operation.seq === undefined) {
-      throw new AccountStoreError(`Could not find appended journal operation ${id}`);
-    }
-    return operation.seq;
-  }
-
   private journalPath(): string {
     return `${this.options.path}.journal`;
   }
@@ -901,19 +913,21 @@ export class AccountStore {
     }
   }
 
-  private sameIdentity(expected: FileIdentity, current: FileIdentity): boolean {
-    if (expected.kind === "missing" || current.kind === "missing") {
-      return expected.kind === "missing" && current.kind === "missing";
+  protected async persistCas(_expected: FileIdentity, contents: string): Promise<boolean> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents);
+    } catch (error) {
+      throw new AccountStoreError("Could not parse generated accounts publication", { cause: error });
     }
-    return (
-      expected.inode === current.inode &&
-      expected.mtimeMs === current.mtimeMs &&
-      expected.size === current.size
-    );
-  }
+    const publication = parseAccountFile(parsed);
+    const publicationSeq = publication.lastAppliedSeq;
+    if (publicationSeq === undefined) {
+      throw new AccountStoreError("Accounts publication is missing its journal sequence");
+    }
 
-  protected async persistCas(expected: FileIdentity, contents: string): Promise<boolean> {
     const temporaryPath = `${this.options.path}.${process.pid}.${randomUUID()}.tmp`;
+    let versionPath = this.versionPath(publicationSeq);
     try {
       await mkdir(dirname(this.options.path), { recursive: true });
       await writeFile(temporaryPath, contents, {
@@ -921,19 +935,39 @@ export class AccountStore {
         flag: "wx",
         mode: 0o600,
       });
-      if (!this.sameIdentity(expected, await this.captureIdentity())) {
-        await this.removeTemporary(temporaryPath);
-        return false;
+      // Preserve the observable pre-publication boundary used by process
+      // tests, but identity no longer gates or authorizes a destructive rename.
+      await this.captureIdentity();
+      try {
+        await link(temporaryPath, versionPath);
+      } catch (error) {
+        if (!hasErrorCode(error, "EEXIST")) throw error;
+        versionPath = this.versionPath(publicationSeq, `${process.pid}.${randomUUID()}`);
+        await link(temporaryPath, versionPath);
       }
-      await rename(temporaryPath, this.options.path);
     } catch (error) {
       await this.removeTemporary(temporaryPath, error);
-      throw new AccountStoreError(`Could not persist accounts file at ${this.options.path}`, {
+      throw new AccountStoreError(`Could not persist accounts version for ${this.options.path}`, {
         cause: error,
       });
     }
     await this.removeTemporary(temporaryPath);
-    return true;
+
+    const authority = await this.readAuthoritativeVersionSnapshot();
+    const won = authority?.name === basename(versionPath);
+    if (won) {
+      // Convenience mirror only. A racing, torn, or failed mirror is harmless
+      // because all store reads select an immutable version whenever one exists.
+      try {
+        await writeFile(this.options.path, contents, { encoding: "utf-8", mode: 0o600 });
+      } catch (error) {
+        this.warn(new AccountStoreJournalWarning(
+          `Could not update convenience accounts snapshot at ${this.options.path}`,
+          { cause: error },
+        ));
+      }
+    }
+    return won;
   }
 
   private async removeTemporary(path: string, primaryError?: unknown): Promise<void> {
@@ -991,6 +1025,12 @@ export class AccountStore {
   }
 
   private async readDiskSnapshotDirect(): Promise<DiskSnapshot> {
+    const authority = await this.readAuthoritativeVersionSnapshot();
+    if (authority !== undefined) return authority;
+    return this.readCanonicalSnapshot();
+  }
+
+  private async readCanonicalSnapshot(): Promise<DiskSnapshot> {
     let contents: string;
     try {
       contents = await readFile(this.options.path, "utf-8");
@@ -1011,11 +1051,82 @@ export class AccountStore {
       });
     }
     const file = parseAccountFile(parsed);
-    return {
-      records: file.accounts,
-      lastAppliedSeq: file.lastAppliedSeq ?? 0,
-      exists: true,
-    };
+    return { records: file.accounts, lastAppliedSeq: file.lastAppliedSeq ?? 0, exists: true };
+  }
+
+  private async readAuthoritativeVersionSnapshot(): Promise<VersionSnapshot | undefined> {
+    let authority: VersionSnapshot | undefined;
+    for (const candidate of await this.versionCandidates()) {
+      let contents: string;
+      try {
+        contents = await readFile(candidate.path, "utf-8");
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) continue;
+        throw new AccountStoreError(`Could not read accounts version at ${candidate.path}`, {
+          cause: error,
+        });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(contents);
+      } catch (error) {
+        throw new AccountStoreError(`Accounts version at ${candidate.path} is not valid JSON`, {
+          cause: error,
+        });
+      }
+      const file = parseAccountFile(parsed);
+      const snapshot: VersionSnapshot = {
+        name: candidate.name,
+        path: candidate.path,
+        publicationSeq: candidate.publicationSeq,
+        records: file.accounts,
+        lastAppliedSeq: file.lastAppliedSeq ?? 0,
+        exists: true,
+      };
+      if (
+        authority === undefined ||
+        snapshot.publicationSeq > authority.publicationSeq ||
+        (snapshot.publicationSeq === authority.publicationSeq &&
+          (snapshot.lastAppliedSeq > authority.lastAppliedSeq ||
+            (snapshot.lastAppliedSeq === authority.lastAppliedSeq && snapshot.name > authority.name)))
+      ) authority = snapshot;
+    }
+    return authority;
+  }
+
+  private async versionCandidates(): Promise<readonly {
+    readonly name: string;
+    readonly path: string;
+    readonly publicationSeq: number;
+  }[]> {
+    const extension = extname(this.options.path) || ".json";
+    const stem = basename(this.options.path, extname(this.options.path));
+    const prefix = `${stem}.v`;
+    let names: string[];
+    try {
+      names = await readdir(dirname(this.options.path));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw new AccountStoreError(`Could not list accounts versions for ${this.options.path}`, {
+        cause: error,
+      });
+    }
+    return names.flatMap((name) => {
+      if (!name.startsWith(prefix) || !name.endsWith(extension)) return [];
+      const body = name.slice(prefix.length, -extension.length);
+      const sequenceText = body.split(".", 1)[0];
+      if (sequenceText === undefined || !/^\d+$/.test(sequenceText)) return [];
+      const publicationSeq = Number(sequenceText);
+      if (!Number.isSafeInteger(publicationSeq)) return [];
+      return [{ name, path: join(dirname(this.options.path), name), publicationSeq }];
+    });
+  }
+
+  private versionPath(publicationSeq: number, suffix?: string): string {
+    const extension = extname(this.options.path) || ".json";
+    const stem = basename(this.options.path, extname(this.options.path));
+    const suffixPart = suffix === undefined ? "" : `.${suffix}`;
+    return join(dirname(this.options.path), `${stem}.v${publicationSeq}${suffixPart}${extension}`);
   }
 
   protected async readFromDisk(): Promise<readonly AccountRecord[]> {

@@ -35,6 +35,8 @@ class ScheduledStore extends AccountStore {
   heldVerify = false;
   heldWrite = false;
   heldJournal = false;
+  heldBeforeState = false;
+  heldAfterState = false;
   heldGc = false;
   inGc = false;
   heldGcSnapshot = false;
@@ -90,7 +92,13 @@ class ScheduledStore extends AccountStore {
       this.heldJournal = true;
       await this.pause("held-before-op");
     }
-    if (modes.has("pause-before-state") && entry.type === "op" && entry.operation.kind === "state") {
+    if (
+      modes.has("pause-before-state") &&
+      entry.type === "op" &&
+      entry.operation.kind === "state" &&
+      !this.heldBeforeState
+    ) {
+      this.heldBeforeState = true;
       await this.pause("held-before-state", { operation: entry.operation });
     }
     await super.appendJournal(entry);
@@ -98,7 +106,13 @@ class ScheduledStore extends AccountStore {
       this.heldJournal = true;
       await this.pause("held-after-op");
     }
-    if (modes.has("pause-after-state") && entry.type === "op" && entry.operation.kind === "state") {
+    if (
+      modes.has("pause-after-state") &&
+      entry.type === "op" &&
+      entry.operation.kind === "state" &&
+      !this.heldAfterState
+    ) {
+      this.heldAfterState = true;
       await this.pause("held-after-state");
     }
   }

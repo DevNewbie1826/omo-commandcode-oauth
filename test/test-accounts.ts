@@ -270,7 +270,10 @@ describe("account store", () => {
 
     const stats = await stat(path);
     expect(stats.mode & 0o777).toBe(0o600);
-    expect(await readdir(dirname(path))).toEqual(["accounts.json"]);
+    expect((await readdir(dirname(path))).sort()).toEqual([
+      "accounts.json",
+      "accounts.v2.json",
+    ]);
 
     const raw = await readRawAccounts(path);
     expect(raw).toEqual({
