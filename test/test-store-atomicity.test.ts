@@ -492,6 +492,59 @@ describe("cross-process optimistic concurrency", () => {
     30_000,
   );
 
+  test.each([
+    ["retryAt", 100, 200],
+    ["createdAt", "2023-11-14T22:13:20.000Z", "2024-11-14T22:13:20.000Z"],
+  ])(
+    "Given racers add the same id and token with different %s fields, When the stale add resumes, Then it rejects rather than accepting the peer's value",
+    async (field, firstValue, secondValue) => {
+      const dir = await tempDir();
+      const path = join(dir, `same-credential-${field}.json`);
+      const base = { id: "a", token: "shared", createdAt: "2023-11-14T22:13:20.000Z" };
+      const firstInput = JSON.stringify({ ...base, [field]: firstValue });
+      const secondInput = JSON.stringify({ ...base, [field]: secondValue });
+      const first = spawnStoreChild(
+        path,
+        "a",
+        "pause-before-op",
+        "add-json",
+        "unused",
+        firstInput,
+      );
+      await first.waitForMessage("held-before-op");
+      const second = spawnStoreChild(path, "a", "normal", "add-json", "unused", secondInput);
+      await expect(second.onceExited).resolves.toBe(0);
+
+      first.stdin.end("resume\n");
+      await expect(first.waitForMessage("error")).resolves.toMatchObject({
+        name: "AccountStoreError",
+        message: "Account credential already exists",
+      });
+      await expect(first.onceExited).resolves.toBe(1);
+    },
+    30_000,
+  );
+
+  test(
+    "Given an uncontended add supplies credits in noncanonical property order, When the record is parsed and verified, Then value equality accepts it",
+    async () => {
+      const dir = await tempDir();
+      const path = join(dir, "credits-order.json");
+      const input = JSON.stringify({
+        id: "a",
+        token: "token-a",
+        credits: { monthly: 1, free: 0, purchased: 0, periodEnd: 200 },
+      });
+      const child = spawnStoreChild(path, "a", "normal", "add-json", "unused", input);
+
+      await expect(child.onceExited).resolves.toBe(0);
+      await expect(new AccountStore({ path }).load()).resolves.toMatchObject([
+        { id: "a", credits: { monthly: 1, purchased: 0, free: 0, periodEnd: 200 } },
+      ]);
+    },
+    30_000,
+  );
+
   test(
     "Given racers add the same id and token with different keyName fields, When both publish, Then exactly one succeeds and the other rejects the credential mismatch",
     async () => {

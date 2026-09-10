@@ -128,6 +128,7 @@ try {
     token,
     ...(value.length === 0 ? {} : { keyName: value }),
   });
+  else if (action === "add-json") await store.add(JSON.parse(value));
   else if (action === "state") {
     await store.mutate((records) =>
       records.map((record) => (record.id === id ? { ...record, keyName: value } : record)),

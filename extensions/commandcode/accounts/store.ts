@@ -246,7 +246,7 @@ export class AccountStore {
         if (matchingId.token !== record.token) {
           throw new AccountStoreError(`Account id already exists: ${record.id}`);
         }
-        if (!this.sameAddIntent(matchingId, record)) {
+        if (!this.sameAddIntent(matchingId, record, input)) {
           throw new AccountStoreError("Account credential already exists");
         }
         return true;
@@ -782,15 +782,27 @@ export class AccountStore {
     return { ...input, enabled: input.enabled ?? true, createdAt };
   }
 
-  private sameAddIntent(candidate: AccountRecord, intended: AccountRecord): boolean {
+  private sameAddIntent(
+    candidate: AccountRecord,
+    intended: AccountRecord,
+    input: AccountRecordInput,
+  ): boolean {
+    const creditsMatch = input.credits === undefined || (
+      candidate.credits?.monthly === intended.credits?.monthly &&
+      candidate.credits?.purchased === intended.credits?.purchased &&
+      candidate.credits?.free === intended.credits?.free &&
+      candidate.credits?.periodEnd === intended.credits?.periodEnd
+    );
     return (
       candidate.id === intended.id &&
       candidate.token === intended.token &&
-      candidate.userId === intended.userId &&
-      candidate.userName === intended.userName &&
-      candidate.keyName === intended.keyName &&
-      candidate.enabled === intended.enabled &&
-      JSON.stringify(candidate.credits) === JSON.stringify(intended.credits)
+      (input.userId === undefined || candidate.userId === intended.userId) &&
+      (input.userName === undefined || candidate.userName === intended.userName) &&
+      (input.keyName === undefined || candidate.keyName === intended.keyName) &&
+      (input.enabled === undefined || candidate.enabled === intended.enabled) &&
+      creditsMatch &&
+      (input.retryAt === undefined || candidate.retryAt === intended.retryAt) &&
+      (input.createdAt === undefined || candidate.createdAt === intended.createdAt)
     );
   }
 
