@@ -66,6 +66,14 @@ export class AccountStoreError extends Error {
   }
 }
 
+/** Non-fatal typed diagnostic emitted when a malformed journal line is skipped. */
+export class AccountStoreJournalWarning extends Error {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "AccountStoreJournalWarning";
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
