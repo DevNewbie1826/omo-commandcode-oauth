@@ -9,6 +9,16 @@ import {
   type FetchImpl,
 } from "../extensions/commandcode/models.js";
 
+/** The exact tier translation measured against the live gateway (see models.ts for the probe log). */
+const MEASURED_THINKING_LEVEL_MAP = {
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max",
+} as const;
+
 const API_RESPONSE = {
   object: "list",
   data: [
@@ -17,7 +27,15 @@ const API_RESPONSE = {
   ],
 } as const;
 const EXPECTED: readonly CommandCodeModel[] = [
-  { id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", api: "openai-completions", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
+  {
+    id: "Qwen/Qwen3.7-Max",
+    name: "Qwen 3.7 Max",
+    api: "openai-completions",
+    reasoning: true,
+    thinkingLevelMap: { ...MEASURED_THINKING_LEVEL_MAP },
+    contextWindow: 1_000_000,
+    maxTokens: 65_536,
+  },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", api: "anthropic-messages", reasoning: true, contextWindow: 200_000, maxTokens: 65_536 },
 ];
 function response(body: unknown, status = 200): Response {
@@ -43,6 +61,46 @@ describe("modelsFromApiResponse", () => {
       object: "list",
       data: [{ id: "gpt-5.5", name: "GPT-5.5", context_length: 128_000.6 }],
     })[0]).toMatchObject({ api: "openai-completions", contextWindow: 128_001, maxTokens: 65_536 });
+  });
+});
+
+describe("thinkingLevelMap", () => {
+  it("attaches the measured gateway map to openai-route catalog ids", () => {
+    const models = modelsFromApiResponse({
+      object: "list",
+      data: [
+        { id: "deepseek/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", context_length: 200_000 },
+        { id: "zai-org/GLM-5.2", name: "GLM-5.2", context_length: 200_000 },
+      ],
+    });
+
+    expect(models[0]?.thinkingLevelMap).toEqual({ ...MEASURED_THINKING_LEVEL_MAP });
+    expect(models[1]?.thinkingLevelMap).toEqual({ ...MEASURED_THINKING_LEVEL_MAP });
+    // The map must pin exactly the six host reasoning levels, translated onto the five values the
+    // gateway accepts (it rejects "minimal"); "off" stays unmapped so the host keeps exposing it
+    // and the adapter merely omits reasoning_effort.
+    expect(Object.keys(models[0]?.thinkingLevelMap ?? {}).sort())
+      .toEqual(["high", "low", "max", "medium", "minimal", "xhigh"]);
+  });
+
+  it("attaches no map to claude ids so native tier inference stays authoritative", () => {
+    const models = modelsFromApiResponse({
+      object: "list",
+      data: [
+        { id: "claude-sonnet-5", name: "Claude Sonnet 5", context_length: 200_000 },
+        { id: "claude-opus-5", name: "Claude Opus 5", context_length: 200_000 },
+      ],
+    });
+
+    expect(models[0]?.thinkingLevelMap).toBeUndefined();
+    expect(models[1]?.thinkingLevelMap).toBeUndefined();
+    for (const model of STATIC_MODELS) {
+      if (model.id.toLowerCase().startsWith("claude")) {
+        expect(model.thinkingLevelMap).toBeUndefined();
+      } else {
+        expect(model.thinkingLevelMap).toEqual({ ...MEASURED_THINKING_LEVEL_MAP });
+      }
+    }
   });
 });
 

@@ -1,7 +1,9 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ProviderConfig } from "@code-yeongyu/senpi";
 import type {
   AssistantMessage,
   AssistantMessageEvent,
@@ -10,6 +12,7 @@ import type {
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
+import commandcodeExtension, { type CommandCodeHost } from "../extensions/commandcode/index.js";
 import {
   AccountPool,
   NoCommandCodeAccountsError,
@@ -447,6 +450,109 @@ describe("installed anthropic adapter boundary", () => {
       });
     } finally {
       await harness.close();
+    }
+  });
+});
+
+describe("registered thinking level map on the openai wire", () => {
+  it("sends reasoning_effort low for reasoning minimal and max for max", async () => {
+    const wireId = "deepseek/deepseek-v4.1-flash";
+    const received: Record<string, unknown>[] = [];
+    const catalog = JSON.stringify({
+      object: "list",
+      data: [
+        { id: wireId, name: "DeepSeek V4.1 Flash", context_length: 200_000 },
+        { id: "claude-sonnet-5", name: "Claude Sonnet 5", context_length: 200_000 },
+      ],
+    });
+    const server: Server = createServer((request, response) => {
+      const path = new URL(request.url ?? "/", "http://localhost").pathname;
+      if (path === "/provider/v1/models") {
+        response.writeHead(200, { "content-type": "application/json" }).end(catalog);
+        return;
+      }
+      if (path === "/provider/v1/chat/completions") {
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => {
+          received.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+          const chunk = (delta: Record<string, unknown>, finishReason: string | null, usage?: Record<string, number>) =>
+            JSON.stringify({
+              id: "c1",
+              object: "chat.completion.chunk",
+              created: 0,
+              model: wireId,
+              choices: [{ index: 0, delta, finish_reason: finishReason }],
+              ...(usage === undefined ? {} : { usage }),
+            });
+          const sse = [
+            `data: ${chunk({ role: "assistant" }, null)}`,
+            `data: ${chunk({}, "stop", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 })}`,
+            "data: [DONE]",
+            "",
+          ].join("\n\n");
+          response.writeHead(200, { "content-type": "text/event-stream" }).end(sse);
+        });
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Loopback server has no port");
+    const directory = await mkdtemp(join(tmpdir(), "commandcode-thinking-wire-"));
+    directories.push(directory);
+    const base = `http://127.0.0.1:${address.port}`;
+    const previousBase = process.env.COMMANDCODE_API_BASE;
+    const previousAccounts = process.env.COMMANDCODE_ACCOUNTS_FILE;
+    process.env.COMMANDCODE_API_BASE = base;
+    process.env.COMMANDCODE_ACCOUNTS_FILE = join(directory, "accounts.json");
+    await writeFile(join(directory, "accounts.json"), JSON.stringify({
+      version: 1,
+      accounts: [{ id: "a1", token: "token-a1", enabled: true, createdAt: "2026-01-01T00:00:00.000Z" }],
+    }));
+    try {
+      let config: ProviderConfig | undefined;
+      const host: CommandCodeHost = { registerProvider: (_name, value) => { config = value; } };
+      await commandcodeExtension(host);
+      if (config?.streamSimple === undefined) throw new Error("Real adapter stream was not registered");
+      if (config.models === undefined) throw new Error("No models were registered");
+      const entry = config.models.find((model) => model.id === wireId);
+      if (entry === undefined) throw new Error(`Model ${wireId} was not registered`);
+      const model: Model<"openai-completions"> = {
+        id: entry.id,
+        name: entry.name,
+        api: "openai-completions",
+        provider: "commandcode",
+        baseUrl: entry.baseUrl ?? `${base}/provider/v1`,
+        reasoning: entry.reasoning,
+        thinkingLevelMap: entry.thinkingLevelMap,
+        input: entry.input,
+        cost: entry.cost,
+        contextWindow: entry.contextWindow,
+        maxTokens: entry.maxTokens,
+      };
+
+      for (const reasoning of ["minimal", "max"] as const) {
+        const events = await collect(config.streamSimple(model, CONTEXT, { reasoning }));
+        expect(events.at(-1)?.type).toBe("done");
+      }
+
+      expect(received.map((body) => body["reasoning_effort"])).toEqual(["low", "max"]);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error ? reject(error) : resolve()),
+      );
+      if (previousBase === undefined) delete process.env.COMMANDCODE_API_BASE;
+      else process.env.COMMANDCODE_API_BASE = previousBase;
+      if (previousAccounts === undefined) delete process.env.COMMANDCODE_ACCOUNTS_FILE;
+      else process.env.COMMANDCODE_ACCOUNTS_FILE = previousAccounts;
     }
   });
 });

@@ -1,3 +1,5 @@
+import type { ThinkingLevelMap } from "@earendil-works/pi-ai";
+
 export const DEFAULT_MODELS_URL = "https://api.commandcode.ai/provider/v1/models";
 const MAX_TOKENS = 65_536;
 const MAX_CONTEXT = 10_000_000;
@@ -14,6 +16,30 @@ const MAX_CONTEXT = 10_000_000;
  * upstream refusal surface verbatim instead of being pre-empted by a guess about capability.
  */
 
+/**
+ * Measured reasoning_effort translation for the openai-completions route. The gateway's own
+ * enumeration error is the source of truth: POST /provider/v1/chat/completions rejects
+ * "minimal" with HTTP 400 invalid_request_error 'expected one of "low"|"medium"|"high"|"xhigh"|"max"',
+ * and live probes with a real key confirmed HTTP 200 for exactly low/medium/high/xhigh/max on six
+ * unrelated families — deepseek/deepseek-v4.1-flash, moonshotai/Kimi-K2.6, zai-org/GLM-5.2,
+ * Qwen/Qwen3.8-Flash, xai/grok-4.5, MiniMaxAI/MiniMax-M2.5 — each with minimal=400 and the other
+ * five=200. "minimal" maps to "low", its nearest accepted value; "off" stays unmapped so the host
+ * keeps exposing it while the adapter simply omits reasoning_effort. Host semantics are precise here:
+ * an explicit null value hides that one ordinary level, but merely omitting an ordinary level does
+ * not hide it (a partial map like {high: "high"} still yields off/minimal/low/medium/high). The
+ * extended tiers work differently: once any map exists, supportsXhigh and supportsMax each require
+ * their key to be present and non-null, so omitting xhigh or max disables exactly that tier. That
+ * is why this map must pin both extended tiers explicitly.
+ */
+const MEASURED_THINKING_LEVEL_MAP: ThinkingLevelMap = {
+  minimal: "low",
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max",
+};
+
 export type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 export type CommandCodeApi = "anthropic-messages" | "openai-completions";
@@ -23,6 +49,8 @@ export interface CommandCodeModel {
   readonly name: string;
   readonly api: CommandCodeApi;
   readonly reasoning: boolean;
+  /** Measured tier map for openai-completions models; always undefined on the anthropic route. */
+  readonly thinkingLevelMap?: ThinkingLevelMap;
   readonly contextWindow: number;
   readonly maxTokens: number;
 }
@@ -61,12 +89,22 @@ export function apiForModel(id: string): CommandCodeApi {
   return id.toLowerCase().startsWith("claude") ? "anthropic-messages" : "openai-completions";
 }
 
+/**
+ * Claude models never carry a thinkingLevelMap: their tiers are unmeasurable on this plan (every
+ * claude model answers 403 MODEL_NOT_IN_PLAN) and the host's native inference already exposes max
+ * for the measured claude ids (supportsMax=true for claude-opus-4-6, claude-opus-5, claude-fable-5
+ * and claude-sonnet-5, though claude-opus-4-1 measured false). The catalog object literally carries
+ * thinkingLevelMap: undefined, while the registration path in index.ts omits the key entirely for
+ * claude models via its conditional spread, so native inference keeps owning these tiers.
+ */
 function catalogModel(id: string, name: string, contextWindow: number): CommandCodeModel {
+  const api = apiForModel(id);
   return {
     id,
     name,
-    api: apiForModel(id),
+    api,
     reasoning: isReasoningModel(id),
+    thinkingLevelMap: api === "openai-completions" ? MEASURED_THINKING_LEVEL_MAP : undefined,
     contextWindow,
     maxTokens: Math.min(contextWindow, MAX_TOKENS),
   };
