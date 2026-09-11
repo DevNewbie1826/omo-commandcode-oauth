@@ -8,8 +8,8 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+} from "@earendil-works/pi-ai/compat";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
 import {
   AccountPool,
   NoCommandCodeAccountsError,
@@ -106,8 +106,7 @@ function emit(events: readonly AssistantMessageEvent[]) {
 function failover(pool: AccountPool, streamSimple: StreamSimpleLike) {
   return createFailoverStream({
     pool,
-    anthropicStreamSimple: streamSimple,
-    openaiStreamSimple: (_model, context, options) => streamSimple(MODEL, context, options),
+    streamSimple,
     createEventStream: createAssistantMessageEventStream,
   });
 }
@@ -196,13 +195,9 @@ describe("stateless request ring", () => {
     const { pool } = await setup(["a1", "a2"]);
     const attempts: string[] = [];
     const terminal = new HttpFailure("mid-stream", 500, { partial: true });
-    const anthropicStreamSimple: StreamSimpleLike = () => {
-      throw new Error("wrong adapter");
-    };
     const streamSimple = createFailoverStream({
       pool,
-      anthropicStreamSimple,
-      openaiStreamSimple: (_model, _context, options) => {
+      streamSimple: (_model, _context, options) => {
         attempts.push(options?.apiKey ?? "");
         const stream = createAssistantMessageEventStream();
         stream.push(startEvent());

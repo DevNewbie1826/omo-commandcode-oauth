@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
-import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
-import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+import type {
+  AssistantMessageEventStream,
+  OAuthCredentials,
+} from "@earendil-works/pi-ai/compat";
 import { AccountPool } from "./accounts/pool.js";
 import { AccountStoreError } from "./accounts/schema.js";
 import { AccountStore, resolveAccountsFilePath } from "./accounts/store.js";
@@ -24,22 +26,18 @@ export { createBillingRefresher };
 const PROVIDER_ID = "commandcode";
 const PROVIDER_NAME = "Command Code (unofficial)";
 
-/** Transport modules are optional at runtime: without them the provider registers without failover. */
-let anthropicStreamSimple: StreamSimpleLike<"anthropic-messages"> | undefined;
-let openaiStreamSimple: StreamSimpleLike<"openai-completions"> | undefined;
+/** The host exposes pi-ai's compatibility surface to extensions as one virtual module. */
+const PI_AI_COMPAT_SPECIFIER = "@earendil-works/pi-ai/compat";
+let compatStreamSimple: StreamSimpleLike | undefined;
 let createEventStream: (() => AssistantMessageEventStream) | undefined;
 try {
-  const [apiMessages, apiCompletions, eventStreams] = await Promise.all([
-    import("@earendil-works/pi-ai/api/anthropic-messages"),
-    import("@earendil-works/pi-ai/api/openai-completions"),
-    import("@earendil-works/pi-ai/utils/event-stream"),
-  ]);
-  anthropicStreamSimple = apiMessages.streamSimple;
-  openaiStreamSimple = apiCompletions.streamSimple;
-  createEventStream = eventStreams.createAssistantMessageEventStream;
+  const compat = await import("@earendil-works/pi-ai/compat");
+  compatStreamSimple = compat.streamSimple;
+  createEventStream = compat.createAssistantMessageEventStream;
 } catch (error) {
   console.debug(
-    `commandcode: pi-ai transport unavailable, registering without failover streaming (${messageOf(error)})`,
+    `commandcode: pi-ai transport unavailable: specifier "${PI_AI_COMPAT_SPECIFIER}" failed; ` +
+      `registering without failover streaming (${messageOf(error)})`,
   );
 }
 
@@ -144,11 +142,10 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
   );
 
   const failover =
-    anthropicStreamSimple === undefined || openaiStreamSimple === undefined || createEventStream === undefined
+    compatStreamSimple === undefined || createEventStream === undefined
       ? undefined
       : createFailoverStream({
-          anthropicStreamSimple,
-          openaiStreamSimple,
+          streamSimple: compatStreamSimple,
           pool,
           createEventStream,
           refreshBilling: (apiKey: string): void => {

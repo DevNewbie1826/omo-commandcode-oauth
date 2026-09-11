@@ -2,25 +2,23 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEvent,
+  AssistantMessageEventStream,
   Context,
   Model,
   SimpleStreamOptions,
-} from "@earendil-works/pi-ai";
-import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+} from "@earendil-works/pi-ai/compat";
 import type { AccountPool } from "./accounts/pool.js";
 import { classifyFailure, type ClassifyFailureInput } from "./ratelimit.js";
-import type { CommandCodeApi } from "./models.js";
 
 export type StreamSimpleResult = AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
-export type StreamSimpleLike<TApi extends CommandCodeApi = "anthropic-messages"> = (
-  model: Model<TApi>, context: Context, options?: SimpleStreamOptions,
+export type StreamSimpleLike = (
+  model: Model<Api>, context: Context, options?: SimpleStreamOptions,
 ) => StreamSimpleResult;
 export type FailoverStreamSimple = (
   model: Model<Api>, context: Context, options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 export interface FailoverStreamOptions {
-  readonly anthropicStreamSimple: StreamSimpleLike<"anthropic-messages">;
-  readonly openaiStreamSimple: StreamSimpleLike<"openai-completions">;
+  readonly streamSimple: StreamSimpleLike;
   readonly pool: AccountPool;
   readonly createEventStream: () => AssistantMessageEventStream;
   readonly refreshBilling?: (apiKey: string) => void;
@@ -138,17 +136,11 @@ function recordingFetch(baseFetch: typeof fetch, record: (failure: UpstreamRespo
     return new Response(failure.body, { status: failure.status, headers: failure.headers });
   };
 }
-function isModel<TApi extends CommandCodeApi>(model: Model<Api>, api: TApi): model is Model<TApi> {
-  return model.api === api;
-}
 function selectAdapter(options: FailoverStreamOptions, model: Model<Api>): SelectedAdapter {
-  if (isModel(model, "anthropic-messages")) {
-    return (context, callOptions) => options.anthropicStreamSimple(model, context, callOptions);
+  if (model.api !== "anthropic-messages" && model.api !== "openai-completions") {
+    throw new UnsupportedCommandCodeApiError(model.api);
   }
-  if (isModel(model, "openai-completions")) {
-    return (context, callOptions) => options.openaiStreamSimple(model, context, callOptions);
-  }
-  throw new UnsupportedCommandCodeApiError(model.api);
+  return (context, callOptions) => options.streamSimple(model, context, callOptions);
 }
 function surface(outer: AssistantMessageEventStream, failure: Failure): void {
   if (failure.event !== undefined) outer.push(failure.event);
