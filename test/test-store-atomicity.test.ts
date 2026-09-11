@@ -1,5 +1,6 @@
-import { fork, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { fork, spawn, type ChildProcess } from "node:child_process";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { build } from "esbuild";
@@ -22,7 +23,7 @@ async function setup(): Promise<{ readonly path: string; readonly store: Account
 }
 
 type ChildMessage = {
-  readonly type: "ready" | "rename" | "done" | "failed";
+  readonly type: "ready" | "starting" | "contended" | "rename" | "done" | "failed" | "zombie" | "reaped";
   readonly id: string;
   readonly name?: string;
   readonly message?: string;
@@ -30,6 +31,7 @@ type ChildMessage = {
 
 function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<ChildMessage> {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error(`Timed out waiting for ${type}`)); }, 10_000);
     const onMessage = (message: ChildMessage): void => {
       if (message.type !== type && message.type !== "failed") return;
       cleanup();
@@ -37,7 +39,11 @@ function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<C
       else resolve(message);
     };
     const onExit = (code: number | null): void => { cleanup(); reject(new Error(`Store child exited ${code}`)); };
-    const cleanup = (): void => { child.off("message", onMessage); child.off("exit", onExit); };
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("exit", onExit);
+    };
     child.on("message", onMessage);
     child.on("exit", onExit);
   });
@@ -45,27 +51,104 @@ function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<C
 
 function nextOutcome(child: ChildProcess): Promise<ChildMessage> {
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error("Timed out waiting for child outcome")); }, 10_000);
     const onMessage = (message: ChildMessage): void => {
       if (message.type !== "rename" && message.type !== "failed") return;
       cleanup();
       resolve(message);
     };
     const onExit = (code: number | null): void => { cleanup(); reject(new Error(`Store child exited ${code}`)); };
-    const cleanup = (): void => { child.off("message", onMessage); child.off("exit", onExit); };
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.off("message", onMessage);
+      child.off("exit", onExit);
+    };
     child.on("message", onMessage);
     child.on("exit", onExit);
   });
 }
 
-async function spawnStoreChild(path: string, id: string): Promise<ChildProcess> {
+async function buildStoreChild(path: string, id: string): Promise<string> {
   const directory = join(path, "..", "children");
   await mkdir(directory, { recursive: true });
   const outfile = join(directory, `store-child-${id}.mjs`);
   await build({ entryPoints: [join(import.meta.dirname, "../test-support/store-child.ts")], bundle: true, platform: "node", format: "esm", outfile });
+  return outfile;
+}
+
+async function spawnStoreChild(path: string, id: string): Promise<ChildProcess> {
+  const outfile = await buildStoreChild(path, id);
   const child = fork(outfile, { env: { ...process.env, STORE_PATH: path, ACCOUNT_ID: id }, stdio: ["ignore", "ignore", "ignore", "ipc"] });
   await nextMessage(child, "ready");
   return child;
 }
+
+function lineInbox(child: ChildProcess): { next(type: ChildMessage["type"]): Promise<ChildMessage> } {
+  const queued: ChildMessage[] = [];
+  const waiters: Array<{
+    readonly type: ChildMessage["type"];
+    readonly resolve: (message: ChildMessage) => void;
+    readonly reject: (cause: Error) => void;
+    readonly timer: ReturnType<typeof setTimeout>;
+  }> = [];
+  createInterface({ input: child.stdout! }).on("line", (line) => {
+    const message = JSON.parse(line) as ChildMessage;
+    const index = waiters.findIndex((waiter) => waiter.type === message.type || message.type === "failed");
+    if (index < 0) queued.push(message);
+    else {
+      const waiter = waiters.splice(index, 1)[0]!;
+      clearTimeout(waiter.timer);
+      if (message.type === "failed") waiter.reject(new Error(message.message));
+      else waiter.resolve(message);
+    }
+  });
+  child.once("exit", (code) => {
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`Zombie parent exited ${code}`));
+    }
+  });
+  return {
+    next(type) {
+      const index = queued.findIndex((message) => message.type === type || message.type === "failed");
+      if (index >= 0) {
+        const message = queued.splice(index, 1)[0]!;
+        return message.type === "failed" ? Promise.reject(new Error(message.message)) : Promise.resolve(message);
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${type}`)), 10_000);
+        waiters.push({ type, resolve, reject, timer });
+      });
+    },
+  };
+}
+
+const ZOMBIE_PARENT = String.raw`
+import os, signal, subprocess, sys
+dead = False
+def child_exited(_signal, _frame):
+  global dead
+  dead = True
+signal.signal(signal.SIGCHLD, child_exited)
+child = subprocess.Popen([sys.argv[1], sys.argv[2]], stdin=subprocess.PIPE,
+  stdout=subprocess.PIPE, text=True, env=os.environ)
+print(child.stdout.readline(), end="", flush=True)
+for command in sys.stdin:
+  command = command.strip()
+  if command == "start":
+    child.stdin.write("start\n"); child.stdin.flush()
+    print(child.stdout.readline(), end="", flush=True)
+    print(child.stdout.readline(), end="", flush=True)
+  elif command == "kill":
+    os.kill(child.pid, signal.SIGKILL)
+    while not dead:
+      signal.pause()
+    print('{"type":"zombie","id":"zombie"}', flush=True)
+  elif command == "reap":
+    child.wait()
+    print('{"type":"reaped","id":"zombie"}', flush=True)
+    break
+`;
 
 describe("AccountStore management writes", () => {
   it("performs CRUD with canonical reloads", async () => {
@@ -96,30 +179,36 @@ describe("AccountStore management writes", () => {
       .toEqual(["a", "b"]);
   });
 
-  it("preserves both acknowledged adds from IPC-gated Node processes", async () => {
-    const { path, store } = await setup();
-    await store.add({ id: "seed", token: "token-seed" });
-    const [a, b] = await Promise.all([spawnStoreChild(path, "a"), spawnStoreChild(path, "b")]);
-    const aRename = nextMessage(a, "rename");
-    const bRename = nextMessage(b, "rename");
-    a.send("start");
-    b.send("start");
-    const first = await Promise.race([aRename, bRename]);
-    const firstChild = first.id === "a" ? a : b;
-    const secondChild = first.id === "a" ? b : a;
-    const lockExists = await stat(`${path}.lock`).then(() => true, () => false);
-    if (!lockExists) await (first.id === "a" ? bRename : aRename);
-    const firstDone = nextMessage(firstChild, "done");
-    firstChild.send("release");
-    await firstDone;
-    if (lockExists) await (first.id === "a" ? bRename : aRename);
-    const secondDone = nextMessage(secondChild, "done");
-    secondChild.send("release");
-    await secondDone;
+  it.each([["a", "b"], ["b", "a"]] as const)(
+    "preserves fresh-owner adds published in %s/%s order",
+    async (firstId, secondId) => {
+      const { path, store } = await setup();
+      await store.add({ id: "seed", token: "token-seed" });
+      const children = {
+        a: await spawnStoreChild(path, "a"),
+        b: await spawnStoreChild(path, "b"),
+      };
+      const first = children[firstId];
+      const second = children[secondId];
+      const firstRename = nextMessage(first, "rename");
+      first.send("start");
+      await firstRename;
+      const secondContended = nextMessage(second, "contended");
+      second.send("start");
+      await secondContended;
 
-    expect((await new AccountStore({ path }).load()).map((account) => account.id).sort())
-      .toEqual(["a", "b", "seed"]);
-  });
+      const firstDone = nextMessage(first, "done");
+      first.send("release");
+      await firstDone;
+      await nextMessage(second, "rename");
+      const secondDone = nextMessage(second, "done");
+      second.send("release");
+      await secondDone;
+
+      expect((await new AccountStore({ path }).load()).map((account) => account.id))
+        .toEqual(["seed", firstId, secondId]);
+    },
+  );
 
   it("never loses an acknowledged add when a live lock owner is aged", async () => {
     const { path, store } = await setup();
@@ -132,7 +221,9 @@ describe("AccountStore management writes", () => {
     expect(() => process.kill(a.pid!, 0)).not.toThrow();
 
     const bOutcome = nextOutcome(b);
+    const bContended = nextMessage(b, "contended");
     b.send({ start: true, nowOffset: 31_000 });
+    await bContended;
     const outcome = await bOutcome;
     const acknowledged = ["seed"];
     if (outcome.type === "rename") {
@@ -150,11 +241,84 @@ describe("AccountStore management writes", () => {
     a.send("release");
     await aDone;
     acknowledged.push("a");
+    await store.add({ id: "later", token: "token-later" });
+    acknowledged.push("later");
     const finalIds = (await new AccountStore({ path }).load()).map((account) => account.id);
     for (const id of acknowledged) expect(finalIds).toContain(id);
   });
 
-  it("recovers an exclusive lock left by a killed owner", async () => {
+  it("lets an aged contender publish after the live owner publishes first", async () => {
+    const { path, store } = await setup();
+    await store.add({ id: "seed", token: "token-seed" });
+    const [a, b] = await Promise.all([spawnStoreChild(path, "a"), spawnStoreChild(path, "b")]);
+    const aRename = nextMessage(a, "rename");
+    a.send("start");
+    await aRename;
+    const bContended = nextMessage(b, "contended");
+    b.send({ start: true, nowOffset: 31_000 });
+    await bContended;
+
+    const aDone = nextMessage(a, "done");
+    a.send("release");
+    await aDone;
+    await nextMessage(b, "rename");
+    const bDone = nextMessage(b, "done");
+    b.send("release");
+    await bDone;
+    await store.add({ id: "later", token: "token-later" });
+
+    expect((await new AccountStore({ path }).load()).map((account) => account.id))
+      .toEqual(["seed", "a", "b", "later"]);
+  });
+
+  it.each([["b", "c"], ["c", "b"]] as const)(
+    "preserves every acknowledged add after a killed owner in %s/%s order",
+    async (firstId, secondId) => {
+      const { path, store } = await setup();
+      await store.add({ id: "seed", token: "token-seed" });
+      const [dead, b, c] = await Promise.all([
+        spawnStoreChild(path, "dead"),
+        spawnStoreChild(path, "b"),
+        spawnStoreChild(path, "c"),
+      ]);
+      const children = { b, c };
+      const deadRename = nextMessage(dead, "rename");
+      dead.send("start");
+      await deadRename;
+
+      const first = children[firstId];
+      const second = children[secondId];
+      const firstContended = nextMessage(first, "contended");
+      first.send("start");
+      await firstContended;
+      const secondContended = nextMessage(second, "contended");
+      second.send("start");
+      await secondContended;
+
+      expect(second.pid).toBeTypeOf("number");
+      process.kill(second.pid!, "SIGSTOP");
+      const exited = new Promise((resolve) => dead.once("exit", resolve));
+      dead.kill("SIGKILL");
+      await exited;
+      await nextMessage(first, "rename");
+
+      const firstDone = nextMessage(first, "done");
+      first.send("release");
+      await firstDone;
+      process.kill(second.pid!, "SIGCONT");
+      await nextMessage(second, "rename");
+      const secondDone = nextMessage(second, "done");
+      second.send("release");
+      await secondDone;
+
+      expect((await new AccountStore({ path }).load()).map((account) => account.id))
+        .toEqual(["seed", firstId, secondId]);
+      expect((await readdir(join(path, ".."))).filter((name) => /lock|socket|sock/i.test(name)))
+        .toEqual([]);
+    },
+  );
+
+  it("recovers immediately after a killed owner without filesystem lock cleanup", async () => {
     const { path } = await setup();
     const child = await spawnStoreChild(path, "killed");
     const reachedRename = nextMessage(child, "rename");
@@ -163,12 +327,40 @@ describe("AccountStore management writes", () => {
     const exited = new Promise((resolve) => child.once("exit", resolve));
     child.kill("SIGKILL");
     await exited;
-    await utimes(`${path}.lock`, new Date(0), new Date(0));
 
     await expect(new AccountStore({ path }).add({ id: "recovered", token: "token-recovered" }))
       .resolves.toBeUndefined();
-    await expect(stat(`${path}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await readdir(join(path, ".."))).filter((name) => /lock|socket|sock/i.test(name)))
+      .toEqual([]);
   });
+
+  it("uses kernel death, not reaping, to recover from a zombie owner", async () => {
+    const { path } = await setup();
+    const outfile = await buildStoreChild(path, "zombie");
+    const parent = spawn("python3", ["-u", "-c", ZOMBIE_PARENT, process.execPath, outfile], {
+      env: { ...process.env, STORE_PATH: path, ACCOUNT_ID: "zombie" },
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    const inbox = lineInbox(parent);
+    await inbox.next("ready");
+    parent.stdin!.write("start\n");
+    await inbox.next("rename");
+    parent.stdin!.write("kill\n");
+    // SIGCHLD was consumed without wait(): the dead Node owner is still a zombie here.
+    await inbox.next("zombie");
+
+    await expect(new AccountStore({ path }).add({ id: "after-zombie", token: "token-after-zombie" }))
+      .resolves.toBeUndefined();
+    expect((await new AccountStore({ path }).load()).map((account) => account.id))
+      .toEqual(["after-zombie"]);
+
+    const exited = new Promise((resolve) => parent.once("exit", resolve));
+    parent.stdin!.write("reap\n");
+    await inbox.next("reaped");
+    await exited;
+    expect((await readdir(join(path, ".."))).filter((name) => /lock|socket|sock/i.test(name)))
+      .toEqual([]);
+  }, 15_000);
 
   it("rejects duplicate ids and credentials without changing the file", async () => {
     const { path, store } = await setup();
