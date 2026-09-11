@@ -1,38 +1,36 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ProviderConfig } from "@code-yeongyu/senpi";
+import { afterEach, describe, expect, it } from "vitest";
 import type {
-  Api,
   AssistantMessage,
   AssistantMessageEvent,
   Context,
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { streamSimple as realAnthropicStreamSimple } from "@earendil-works/pi-ai/api/anthropic-messages";
-import type { OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import { AccountPool } from "../extensions/commandcode/accounts/pool.js";
-import { AccountStore } from "../extensions/commandcode/accounts/store.js";
-import { closeServer } from "../extensions/commandcode/auth-server.js";
-import { createBillingCache, type BillingSnapshot } from "../extensions/commandcode/billing.js";
-import { parseCooldown } from "../extensions/commandcode/ratelimit.js";
 import {
-  createFailoverStream,
-  type StreamSimpleLike,
-} from "../extensions/commandcode/transport.js";
-import commandcodeExtension, {
-  createBillingRefresher,
-  createPinnedAccountResolver,
-} from "../extensions/commandcode/index.js";
+  AccountPool,
+  NoCommandCodeAccountsError,
+} from "../extensions/commandcode/accounts/pool.js";
+import { AccountStore } from "../extensions/commandcode/accounts/store.js";
+import { createFailoverStream, type StreamSimpleLike } from "../extensions/commandcode/transport.js";
 
-const BASE_MS = 1_700_000_000_000;
-const RESET_SECONDS = 1_758_000_000;
-const RESET_ISO = new Date(RESET_SECONDS * 1000).toISOString();
+const NOW = 1_700_000_000_000;
+const MODEL: Model<"anthropic-messages"> = {
+  id: "claude-sonnet-4-6",
+  name: "claude-sonnet-4-6",
+  api: "anthropic-messages",
+  provider: "commandcode",
+  baseUrl: "https://api.commandcode.ai/provider",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 200_000,
+  maxTokens: 65_536,
+};
+const CONTEXT: Context = { messages: [] };
 const ZERO_USAGE = {
   input: 0,
   output: 0,
@@ -42,107 +40,53 @@ const ZERO_USAGE = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 } as const;
 
-const MODEL: Model<"anthropic-messages"> = {
-  id: "claude-sonnet-4-6",
-  name: "claude-sonnet-4-6",
-  api: "anthropic-messages",
-  provider: "commandcode",
-  baseUrl: "https://api.commandcode.ai",
-  reasoning: true,
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 200_000,
-  maxTokens: 65_536,
-};
-
-const CONTEXT: Context = { messages: [] };
-
 class HttpFailure extends Error {
-  readonly status: number;
-  readonly body: unknown;
-  readonly headers: Readonly<Record<string, string>> | undefined;
-
   constructor(
     message: string,
-    status: number,
-    body: unknown,
-    headers?: Readonly<Record<string, string>>,
+    readonly status: number,
+    readonly body: unknown,
   ) {
     super(message);
     this.name = "HttpFailure";
-    this.status = status;
-    this.body = body;
-    this.headers = headers;
   }
 }
 
-interface Clock {
-  readonly now: () => number;
-}
-
-function makeClock(startMs: number = BASE_MS): Clock {
-  const nowMs = startMs;
-  return { now: () => nowMs };
-}
-
-const staleDirs: string[] = [];
-const staleServers: Server[] = [];
-
+const directories: string[] = [];
 afterEach(async () => {
-  vi.unstubAllEnvs();
-  vi.unstubAllGlobals();
-  const servers = staleServers.splice(0, staleServers.length);
-  const dirs = staleDirs.splice(0, staleDirs.length);
-  await Promise.all([
-    ...servers.map((server) => closeServer(server)),
-    ...dirs.map((dir) => rm(dir, { recursive: true, force: true })),
-  ]);
+  await Promise.all(directories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-async function tempDir(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "commandcode-wiring-"));
-  staleDirs.push(dir);
-  return dir;
-}
-
-async function setupPool(ids: readonly string[]): Promise<{
-  readonly store: AccountStore;
+async function setup(ids: readonly string[]): Promise<{
   readonly pool: AccountPool;
-  readonly clock: Clock;
+  readonly path: string;
 }> {
-  const dir = await tempDir();
-  const clock = makeClock();
-  const store = new AccountStore({ path: join(dir, "accounts.json"), now: clock.now });
-  for (const id of ids) {
-    await store.add({ id, token: `token-${id}`, createdAt: new Date(clock.now()).toISOString() });
-  }
-  return { store, pool: new AccountPool({ store, now: clock.now }), clock };
+  const dir = await mkdtemp(join(tmpdir(), "commandcode-ring-"));
+  directories.push(dir);
+  const path = join(dir, "accounts.json");
+  const store = new AccountStore({ path, now: () => NOW });
+  for (const id of ids) await store.add({ id, token: `token-${id}` });
+  return { pool: new AccountPool({ store, now: () => NOW }), path };
 }
 
-function assistantMessage(stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {
+function message(stopReason: AssistantMessage["stopReason"]): AssistantMessage {
   return {
     role: "assistant",
     content: [],
-    api: "anthropic-messages",
-    provider: "commandcode",
+    api: MODEL.api,
+    provider: MODEL.provider,
     model: MODEL.id,
     usage: ZERO_USAGE,
     stopReason,
-    errorMessage,
-    timestamp: BASE_MS,
+    timestamp: NOW,
   };
 }
 
 function startEvent(): AssistantMessageEvent {
-  return { type: "start", partial: assistantMessage("stop") };
+  return { type: "start", partial: message("stop") };
 }
 
 function doneEvent(): AssistantMessageEvent {
-  return { type: "done", reason: "stop", message: assistantMessage("stop") };
-}
-
-function errorEvent(message: string): AssistantMessageEvent {
-  return { type: "error", reason: "error", error: assistantMessage("error", message) };
+  return { type: "done", reason: "stop", message: message("stop") };
 }
 
 function emit(events: readonly AssistantMessageEvent[]) {
@@ -151,815 +95,132 @@ function emit(events: readonly AssistantMessageEvent[]) {
   return stream;
 }
 
+function failover(pool: AccountPool, streamSimple: StreamSimpleLike) {
+  return createFailoverStream({
+    pool,
+    anthropicStreamSimple: streamSimple,
+    createEventStream: createAssistantMessageEventStream,
+    now: () => NOW,
+  });
+}
+
 async function collect(stream: AsyncIterable<AssistantMessageEvent>): Promise<readonly AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = [];
   for await (const event of stream) events.push(event);
   return events;
 }
 
-function errorMessageOf(events: readonly AssistantMessageEvent[]): string | undefined {
-  for (const event of events) {
-    if (event.type === "error") return event.error.errorMessage;
-  }
-  return undefined;
-}
-
-function retryAfterFailure(): HttpFailure {
-  return new HttpFailure("rate limited", 429, {}, { "retry-after": "30" });
-}
-
-function resetBodyFailure(): HttpFailure {
-  return new HttpFailure("rate limited", 429, {
-    error: {
-      code: "RATE_LIMITED",
-      rateLimit: { window: "daily", reset: RESET_SECONDS },
-    },
-  });
-}
-
-function failover(options: {
-  readonly pool: AccountPool;
-  readonly clock: Clock;
-  readonly anthropicStreamSimple: StreamSimpleLike;
-  readonly resolveAccountIdByToken?: (token: string) => Promise<string | undefined>;
-}) {
-  return createFailoverStream({
-    anthropicStreamSimple: options.anthropicStreamSimple,
-    pool: options.pool,
-    parseCooldown,
-    billingCache: createBillingCache({ now: options.clock.now }),
-    sessionIdFromContext: () => "session-test",
-    createEventStream: createAssistantMessageEventStream,
-    now: options.clock.now,
-    refreshBilling: () => undefined,
-    ...(options.resolveAccountIdByToken === undefined
-      ? {}
-      : { resolveAccountIdByToken: options.resolveAccountIdByToken }),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Real-adapter wire harness (loopback anthropic-messages double)
-// ---------------------------------------------------------------------------
-
-interface RecordedRequest {
-  readonly pathname: string;
-  readonly authorization: string | undefined;
-  readonly apiKey: string | undefined;
-}
-
-interface RecordingServer {
-  readonly port: number;
-  readonly requests: readonly RecordedRequest[];
-  readonly server: Server;
-}
-
-function sse(event: string, data: unknown): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-/** Minimal valid anthropic-messages SSE stream (one text block, end_turn). */
-const ANTHROPIC_SSE_SUCCESS = [
-  sse("message_start", {
-    type: "message_start",
-    message: {
-      id: "msg_wire-1",
-      type: "message",
-      role: "assistant",
-      content: [],
-      model: MODEL.id,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 1,
-        output_tokens: 1,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-      },
-    },
-  }),
-  sse("content_block_start", {
-    type: "content_block_start",
-    index: 0,
-    content_block: { type: "text", text: "" },
-  }),
-  sse("content_block_delta", {
-    type: "content_block_delta",
-    index: 0,
-    delta: { type: "text_delta", text: "hello" },
-  }),
-  sse("content_block_stop", { type: "content_block_stop", index: 0 }),
-  sse("message_delta", {
-    type: "message_delta",
-    delta: { stop_reason: "end_turn", stop_sequence: null },
-    usage: { output_tokens: 2 },
-  }),
-  sse("message_stop", { type: "message_stop" }),
-].join("");
-
-function rateLimitedBody(): unknown {
-  return {
-    type: "error",
-    error: { type: "rate_limit_error" },
-    rateLimit: { window: "daily", reset: RESET_SECONDS },
-  };
-}
-
-/** Records {path, authorization, x-api-key} per request; 429s every token except token-b (SSE success). */
-function startRecordingAnthropicServer(): Promise<RecordingServer> {
-  const requests: RecordedRequest[] = [];
-  const server = createServer((request, response) => {
-    request.resume();
-    const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
-    const authorization =
-      typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
-    const apiKey =
-      typeof request.headers["x-api-key"] === "string" ? request.headers["x-api-key"] : undefined;
-    requests.push({ pathname, authorization, apiKey });
-    if (authorization !== "Bearer token-b") {
-      response.writeHead(429, { "content-type": "application/json" });
-      response.end(JSON.stringify(rateLimitedBody()));
-      return;
-    }
-    response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end(ANTHROPIC_SSE_SUCCESS);
-  });
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.removeListener("error", reject);
-      const address = server.address();
-      if (address === null || typeof address === "string") {
-        reject(new Error("Expected the recording server to bind a TCP port"));
-        return;
-      }
-      resolve({ port: address.port, requests, server });
-    });
-  });
-}
-
-function onAuthSignal(): { readonly onAuth: OAuthLoginCallbacks["onAuth"]; readonly url: Promise<string> } {
-  let resolveUrl: ((url: string) => void) | undefined;
-  const url = new Promise<string>((resolve) => {
-    resolveUrl = resolve;
-  });
-  const onAuth: OAuthLoginCallbacks["onAuth"] = (info) => resolveUrl?.(info.url);
-  return { onAuth, url };
-}
-
-/** Intercept whoami with a valid identity; everything else (loopback callback, models) goes to the real fetch. */
-function stubWhoamiApi(): void {
-  const realFetch = globalThis.fetch;
-  vi.stubGlobal(
-    "fetch",
-    vi.fn<typeof fetch>(async (input, init) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      if (url.includes("/alpha/whoami")) {
-        return new Response(JSON.stringify({ user: { id: "u-1", userName: "tester" } }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
-      }
-      return realFetch(input, init);
-    }),
+async function failureOf(stream: AsyncIterable<AssistantMessageEvent>): Promise<unknown> {
+  return collect(stream).then(
+    () => undefined,
+    (error: unknown) => error,
   );
 }
 
-describe("createFailoverStream", () => {
-  it("Given account1 fails with a 429 before emitting, When the wrapper streams, Then it quarantines account1 and forwards account2 events", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        const token = options?.apiKey ?? "";
-        seen.push(token);
-        if (token === "token-account1") return Promise.reject(retryAfterFailure());
-        return emit([startEvent(), doneEvent()]);
-      },
+describe("stateless request ring", () => {
+  it("T1 all-429: attempts [a1,a2,a3,a4,a5,a1] and fails with FINAL-429 verbatim", async () => {
+    const { pool } = await setup(["a1", "a2", "a3", "a4", "a5"]);
+    const attempts: string[] = [];
+    const final = new HttpFailure("FINAL-429", 429, { marker: "FINAL-429" });
+    const streamSimple = failover(pool, (_model, _context, options) => {
+      const id = (options?.apiKey ?? "").replace("token-", "");
+      attempts.push(id);
+      return Promise.reject(
+        id === "a1" && attempts.length === 6
+          ? final
+          : new HttpFailure(`429-${id}`, 429, { marker: id }),
+      );
     });
 
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-    const records = await store.load();
-    const quarantined = records.find((record) => record.id === "account1");
+    const failure = await failureOf(streamSimple(MODEL, CONTEXT, {}));
 
-    expect(seen).toEqual(["token-account1", "token-account2"]);
-    expect(quarantined?.retryAt).toBe(BASE_MS + 30_000);
-    expect(events.map((event) => event.type)).toEqual(["start", "done"]);
+    expect(attempts).toEqual(["a1", "a2", "a3", "a4", "a5", "a1"]);
+    expect(failure).toBe(final);
+    expect(failure).toMatchObject({ status: 429, body: { marker: "FINAL-429" } });
   });
 
-  it("Given account1 fails with a body-declared reset before emitting, When the wrapper streams, Then it quarantines account1 until that reset and retries with account2", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        const token = options?.apiKey ?? "";
-        seen.push(token);
-        if (token === "token-account1") return Promise.reject(resetBodyFailure());
-        return emit([startEvent(), doneEvent()]);
-      },
+  it("T2 rotate-then-success: a second request starts from a1 again", async () => {
+    const { pool } = await setup(["a1", "a2"]);
+    const attempts: string[] = [];
+    const streamSimple = failover(pool, (_model, _context, options) => {
+      const id = (options?.apiKey ?? "").replace("token-", "");
+      attempts.push(id);
+      return id === "a1"
+        ? Promise.reject(new HttpFailure("limited", 429, { account: id }))
+        : emit([startEvent(), doneEvent()]);
     });
 
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-    const records = await store.load();
-    const quarantined = records.find((record) => record.id === "account1");
-
-    expect(seen).toEqual(["token-account1", "token-account2"]);
-    expect(quarantined?.retryAt).toBe(RESET_SECONDS * 1000);
-    expect(events.map((event) => event.type)).toEqual(["start", "done"]);
-    expect(streamSimple).toBeTypeOf("function");
+    expect((await collect(streamSimple(MODEL, CONTEXT, {}))).at(-1)?.type).toBe("done");
+    expect((await collect(streamSimple(MODEL, CONTEXT, {}))).at(-1)?.type).toBe("done");
+    expect(attempts).toEqual(["a1", "a2", "a1", "a2"]);
   });
 
-  it("Given account1 fails with a non-cooldown 401 before emitting, When the wrapper streams, Then the failure propagates without quarantine or retry", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        const token = options?.apiKey ?? "";
-        seen.push(token);
-        if (token === "token-account1") return Promise.reject(new HttpFailure("invalid key", 401, {}));
-        return emit([startEvent(), doneEvent()]);
-      },
+  it("T3 401 immediate: propagates the original error and never calls a2", async () => {
+    const { pool } = await setup(["a1", "a2"]);
+    const attempts: string[] = [];
+    const unauthorized = new HttpFailure("unauthorized", 401, { error: "invalid token" });
+    const streamSimple = failover(pool, (_model, _context, options) => {
+      attempts.push(options?.apiKey ?? "");
+      return Promise.reject(unauthorized);
     });
 
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-    const records = await store.load();
-
-    expect(seen).toEqual(["token-account1"]);
-    expect(records.find((record) => record.id === "account1")?.retryAt).toBeUndefined();
-    expect(events.map((event) => event.type)).toEqual(["error"]);
-    expect(errorMessageOf(events)).toBe("invalid key");
+    expect(await failureOf(streamSimple(MODEL, CONTEXT, {}))).toBe(unauthorized);
+    expect(attempts).toEqual(["token-a1"]);
   });
 
-  it("Given account1 errors after the first forwarded event, When the wrapper streams, Then the outer stream fails and account2 is never called", async () => {
-    const { pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        const token = options?.apiKey ?? "";
-        seen.push(token);
-        return emit([startEvent(), errorEvent("mid-stream failure")]);
-      },
+  it("T4 post-output failure: propagates without replay", async () => {
+    const { pool } = await setup(["a1", "a2"]);
+    const attempts: string[] = [];
+    const terminal = new HttpFailure("mid-stream", 500, { partial: true });
+    const streamSimple = failover(pool, (_model, _context, options) => {
+      attempts.push(options?.apiKey ?? "");
+      const stream = createAssistantMessageEventStream();
+      stream.push(startEvent());
+      stream.fail(terminal);
+      return stream;
     });
 
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-
-    expect(seen).toEqual(["token-account1"]);
-    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
-    expect(errorMessageOf(events)).toBe("mid-stream failure");
+    expect(await failureOf(streamSimple(MODEL, CONTEXT, {}))).toBe(terminal);
+    expect(attempts).toEqual(["token-a1"]);
   });
 
-  it("Given account1 emits output then a terminal error event, When the wrapper streams, Then the error propagates without retry AND account1 is quarantined for future requests", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        seen.push(options?.apiKey ?? "");
-        return emit([
-          startEvent(),
-          errorEvent(
-            `429 ${JSON.stringify({
-              error: { code: "RATE_LIMITED", rateLimit: { window: "daily", reset: RESET_SECONDS } },
-            })}`,
-          ),
-        ]);
-      },
-    });
-
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-
-    expect(seen).toEqual(["token-account1"]);
-    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
-    const records = await store.load();
-    expect(records.find((record) => record.id === "account1")?.retryAt).toBe(RESET_SECONDS * 1000);
-    const next = await pool.next(clock.now());
-    expect(next.id).toBe("account2");
-  });
-
-  it("Given the adapter iterator throws after forwarding an event, When the wrapper streams, Then the thrown failure propagates without retry AND the account is quarantined", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        seen.push(options?.apiKey ?? "");
-        const inner = createAssistantMessageEventStream();
-        inner.push(startEvent());
-        inner.fail(retryAfterFailure());
-        return inner;
-      },
-    });
-
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-
-    expect(seen).toEqual(["token-account1"]);
-    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
-    expect(errorMessageOf(events)).toBe("rate limited");
-    const records = await store.load();
-    expect(records.find((record) => record.id === "account1")?.retryAt).toBe(BASE_MS + 30_000);
-    const next = await pool.next(clock.now());
-    expect(next.id).toBe("account2");
-  });
-
-  it("Given every account is rate-limited, When the wrapper streams, Then the outer stream fails with a NoHealthyAccounts message containing the reset ISO", async () => {
-    const { pool, clock } = await setupPool(["account1", "account2"]);
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: () => Promise.reject(resetBodyFailure()),
-    });
-
-    const events = await collect(streamSimple(MODEL, CONTEXT, {}));
-
-    expect(errorMessageOf(events)).toContain(RESET_ISO);
-    expect(errorMessageOf(events)).toMatch(/No healthy Command Code accounts/i);
-  });
-});
-
-describe("createFailoverStream (real adapter wire)", () => {
-  it("Given a host-pinned Authorization preset and a rate-limited first account, When the real pi-ai streamSimple drives the failover wrapper, Then exactly two requests hit /provider/v1/messages carrying Bearer token-a then Bearer token-b", async () => {
-    const { store, pool, clock } = await setupPool(["a", "b"]);
-    const recording = await startRecordingAnthropicServer();
-    staleServers.push(recording.server);
-
-    const wireModel: Model<"anthropic-messages"> = {
-      ...MODEL,
-      baseUrl: `http://127.0.0.1:${recording.port}/provider`,
-    };
-    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
-
-    // Hosts with authHeader providers inject a preset Authorization header; the
-    // second attempt must not leak it onto the wire.
-    const events = await collect(
-      streamSimple(wireModel, CONTEXT, { headers: { Authorization: "Bearer token-a" } }),
+  it("T5 file untouched: full rotation changes neither content nor mtime", async () => {
+    const { pool, path } = await setup(["a1", "a2", "a3"]);
+    const beforeContent = await readFile(path);
+    const beforeMtime = (await stat(path, { bigint: true })).mtimeNs;
+    const streamSimple = failover(pool, () =>
+      Promise.reject(new HttpFailure("limited", 429, { limited: true })),
     );
 
-    expect(recording.requests).toHaveLength(2);
-    expect(recording.requests.map((request) => request.pathname)).toEqual([
-      "/provider/v1/messages",
-      "/provider/v1/messages",
-    ]);
-    expect(recording.requests.map((request) => request.authorization)).toEqual([
-      "Bearer token-a",
-      "Bearer token-b",
-    ]);
-    expect(recording.requests.map((request) => request.apiKey)).toEqual(["token-a", "token-b"]);
-    expect(events.at(-1)?.type).toBe("done");
-    expect(JSON.stringify(events)).toContain("hello");
-    const records = await store.load();
-    expect(records.find((record) => record.id === "a")?.retryAt).toBeDefined();
+    await failureOf(streamSimple(MODEL, CONTEXT, {}));
+
+    expect(await readFile(path)).toEqual(beforeContent);
+    expect((await stat(path, { bigint: true })).mtimeNs).toBe(beforeMtime);
   });
 
-  it("Given the provider answers token-a with 429 and only a Retry-After: 3600 header (no JSON body), When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined for the full hour instead of the 60s default", async () => {
-    const { store, pool, clock } = await setupPool(["a", "b"]);
-    const authorizations: string[] = [];
-    const server = createServer((request, response) => {
-      request.resume();
-      const authorization =
-        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
-      if (authorization !== undefined) authorizations.push(authorization);
-      if (authorization !== "Bearer token-b") {
-        // Deliberately no JSON body: the retry hint must reach the transport
-        // solely through the adapter's canonical message marker.
-        response.writeHead(429, { "retry-after": "3600" });
-        response.end("slow down");
-        return;
-      }
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(ANTHROPIC_SSE_SUCCESS);
-    });
-    staleServers.push(server);
-    const port = await new Promise<number>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        server.removeListener("error", reject);
-        const address = server.address();
-        if (address === null || typeof address === "string") {
-          reject(new Error("Expected the retry-hint server to bind a TCP port"));
-          return;
-        }
-        resolve(address.port);
-      });
-    });
+  it("T6 zero accounts: selection fails with the typed error", async () => {
+    const { pool } = await setup([]);
+    const streamSimple = failover(pool, () => emit([doneEvent()]));
 
-    const wireModel: Model<"anthropic-messages"> = {
-      ...MODEL,
-      baseUrl: `http://127.0.0.1:${port}/provider`,
-    };
-    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
-
-    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
-
-    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
-    expect(events.at(-1)?.type).toBe("done");
-    const records = await store.load();
-    // The adapter folds "Retry-After: 3600" into its canonical
-    // "(retry-after-ms: 3600000)" message marker; the transport must persist
-    // the full hour rather than the 60s default quarantine.
-    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS + 3_600_000);
-    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
+    const failure = await failureOf(streamSimple(MODEL, CONTEXT, {}));
+    expect(failure).toBeInstanceOf(NoCommandCodeAccountsError);
+    expect(failure).toMatchObject({ message: "No Command Code accounts" });
   });
 
-  it("Given the provider answers token-a with 429 and only a Retry-After: 0 header (no JSON body), When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined until now (retry-immediately) and the request completes via token-b", async () => {
-    const { store, pool, clock } = await setupPool(["a", "b"]);
-    const authorizations: string[] = [];
-    const server = createServer((request, response) => {
-      request.resume();
-      const authorization =
-        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
-      if (authorization !== undefined) authorizations.push(authorization);
-      if (authorization !== "Bearer token-b") {
-        // Adapter emits "(retry-after-ms: 0)" meaning retry-immediately; the
-        // transport must persist retryAt === now rather than the 60s default.
-        response.writeHead(429, { "retry-after": "0" });
-        response.end("slow down");
-        return;
-      }
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(ANTHROPIC_SSE_SUCCESS);
-    });
-    staleServers.push(server);
-    const port = await new Promise<number>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        server.removeListener("error", reject);
-        const address = server.address();
-        if (address === null || typeof address === "string") {
-          reject(new Error("Expected the zero-hint server to bind a TCP port"));
-          return;
-        }
-        resolve(address.port);
-      });
+  it("replaces host Authorization with the selected account token", async () => {
+    const { pool } = await setup(["a1"]);
+    let observed: SimpleStreamOptions | undefined;
+    const streamSimple = failover(pool, (_model, _context, options) => {
+      observed = options;
+      return emit([doneEvent()]);
     });
 
-    const wireModel: Model<"anthropic-messages"> = {
-      ...MODEL,
-      baseUrl: `http://127.0.0.1:${port}/provider`,
-    };
-    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
-
-    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
-
-    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
-    expect(events.at(-1)?.type).toBe("done");
-    const records = await store.load();
-    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS);
-    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
-  });
-
-  it("Given token-a 429 with rateLimit.reset: -1 plus Retry-After: 3600 and a healthy token-b, When the real pi-ai streamSimple drives the failover wrapper, Then account-a is quarantined for the hour (not -1000), token-b is attempted, the stream succeeds, and the accounts file still loads", async () => {
-    const { store, pool, clock } = await setupPool(["a", "b"]);
-    const authorizations: string[] = [];
-    const server = createServer((request, response) => {
-      request.resume();
-      const authorization =
-        typeof request.headers.authorization === "string" ? request.headers.authorization : undefined;
-      if (authorization !== undefined) authorizations.push(authorization);
-      if (authorization !== "Bearer token-b") {
-        response.writeHead(429, { "content-type": "application/json", "retry-after": "3600" });
-        response.end(
-          JSON.stringify({
-            error: { type: "rate_limit_error", rateLimit: { reset: -1 }, message: "slow down" },
-          }),
-        );
-        return;
-      }
-      response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end(ANTHROPIC_SSE_SUCCESS);
-    });
-    staleServers.push(server);
-    const port = await new Promise<number>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        server.removeListener("error", reject);
-        const address = server.address();
-        if (address === null || typeof address === "string") {
-          reject(new Error("Expected the invalid-hint server to bind a TCP port"));
-          return;
-        }
-        resolve(address.port);
-      });
-    });
-
-    const wireModel: Model<"anthropic-messages"> = {
-      ...MODEL,
-      baseUrl: `http://127.0.0.1:${port}/provider`,
-    };
-    const streamSimple = failover({ pool, clock, anthropicStreamSimple: realAnthropicStreamSimple });
-
-    const events = await collect(streamSimple(wireModel, CONTEXT, {}));
-
-    expect(authorizations).toEqual(["Bearer token-a", "Bearer token-b"]);
-    expect(events.at(-1)?.type).toBe("done");
-    const records = await store.load();
-    // Invalid body reset (-1 → -1000ms) must not win over the valid Retry-After: 3600
-    // header / adapter marker; the composed pipeline falls through to the hour.
-    expect(records.find((record) => record.id === "a")?.retryAt).toBe(BASE_MS + 3_600_000);
-    expect(records.find((record) => record.id === "a")?.retryAt).not.toBe(-1000);
-    expect(records.find((record) => record.id === "b")?.retryAt).toBeUndefined();
-  });
-});
-
-describe("pinned options.apiKey", () => {
-  it("Given the pinned account is cooling down, When the host pins its token, Then rotation falls through to the healthy other account", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    await pool.quarantine("account1", clock.now() + 60_000);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        seen.push(options?.apiKey ?? "");
-        return emit([startEvent(), doneEvent()]);
-      },
-      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
-    });
-
-    const events = await collect(
-      streamSimple(MODEL, CONTEXT, { apiKey: "token-account1", sessionId: "session-pinned" }),
-    );
-
-    expect(seen).toEqual(["token-account2"]);
-    expect(events.map((event) => event.type)).toEqual(["start", "done"]);
-  });
-
-  it("Given the pinned account is disabled, When the host pins its token, Then rotation falls through to the healthy other account", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    await store.setEnabled("account1", false);
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
-        seen.push(options?.apiKey ?? "");
-        return emit([startEvent(), doneEvent()]);
-      },
-      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
-    });
-
-    const events = await collect(
-      streamSimple(MODEL, CONTEXT, { apiKey: "token-account1", sessionId: "session-pinned" }),
-    );
-
-    expect(seen).toEqual(["token-account2"]);
-    expect(events.map((event) => event.type)).toEqual(["start", "done"]);
-  });
-
-  it("Given a session holds a healthy sticky binding, When the host pins a different healthy token, Then the sticky binding wins over the pin", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const adapter: StreamSimpleLike = (_model, _context, options) => {
-      seen.push(options?.apiKey ?? "");
-      return emit([startEvent(), doneEvent()]);
-    };
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: adapter,
-      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
-    });
-
-    // Seed a sticky session binding on account1.
-    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
-    // The healthy pin must not displace the healthy sticky binding...
-    await collect(
-      streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky", apiKey: "token-account2" }),
-    );
-    // ...and the binding survives for the follow-up request.
-    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-sticky" }));
-
-    expect(seen).toEqual(["token-account1", "token-account1", "token-account1"]);
-  });
-
-  it("Given the pinned account is healthy but another account holds tier-0 credits, When the host pins its token, Then the tier-0 account wins over the pin", async () => {
-    const { store, pool, clock } = await setupPool(["plain", "expiring"]);
-    await store.mutate((records) =>
-      records.map((record) =>
-        record.id === "expiring"
-          ? {
-              ...record,
-              credits: { monthly: 10, purchased: 0, free: 0, periodEnd: clock.now() + 3_600_000 },
-            }
-          : record,
-      ),
-    );
-    const seen: string[] = [];
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: (
-        _model: Model<Api>,
-        _context: Context,
-        options?: SimpleStreamOptions,
-      ) => {
-        seen.push(options?.apiKey ?? "");
-        return emit([startEvent(), doneEvent()]);
-      },
-      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
-    });
-
-    await collect(streamSimple(MODEL, CONTEXT, { apiKey: "token-plain" }));
-
-    expect(seen).toEqual(["token-expiring"]);
-  });
-
-  it("Given the pinned account is healthy with no sticky binding or tier-0 candidates, When the host pins its token, Then the pin sorts first within tier 1 and binds the session", async () => {
-    const { store, pool, clock } = await setupPool(["account1", "account2"]);
-    const seen: string[] = [];
-    const adapter: StreamSimpleLike = (_model, _context, options) => {
-      seen.push(options?.apiKey ?? "");
-      return emit([startEvent(), doneEvent()]);
-    };
-    const streamSimple = failover({
-      pool,
-      clock,
-      anthropicStreamSimple: adapter,
-      resolveAccountIdByToken: createPinnedAccountResolver(store, clock.now),
-    });
-
-    // The pin overrides tier-1 file order (account1 is first on disk)...
-    await collect(
-      streamSimple(MODEL, CONTEXT, { sessionId: "session-pinned", apiKey: "token-account2" }),
-    );
-    // ...and the pinned selection bound the session for follow-up requests.
-    await collect(streamSimple(MODEL, CONTEXT, { sessionId: "session-pinned" }));
-
-    expect(seen).toEqual(["token-account2", "token-account2"]);
-  });
-});
-
-describe("createBillingRefresher", () => {
-  it("Given an expiring-credits snapshot, When the refresh persists it, Then the credits land in the accounts file and tier-0 selection activates", async () => {
-    const { store, pool, clock } = await setupPool(["regular", "expiring"]);
-    const snapshot: BillingSnapshot = {
-      monthly: 10,
-      purchased: 0,
-      free: 5,
-      periodEnd: BASE_MS + 3_600_000,
-    };
-    const fetchBilling = vi.fn<(apiKey: string) => Promise<BillingSnapshot | undefined>>(
-      async (apiKey) => (apiKey === "token-expiring" ? snapshot : undefined),
-    );
-    const refresher = createBillingRefresher({
-      store,
-      billingCache: createBillingCache({ now: clock.now }),
-      fetchBilling,
-    });
-
-    // Without persisted credits the pool cannot see the expiring account.
-    const before = await pool.next(clock.now());
-    expect(before.id).toBe("regular");
-
-    await refresher("token-expiring");
-
-    const records = await store.load();
-    expect(records.find((record) => record.id === "expiring")?.credits).toEqual(snapshot);
-    const after = await pool.next(clock.now());
-    expect(after.id).toBe("expiring");
-  });
-
-  it("Given concurrent refreshes for one key, When they run together, Then billing is fetched once and all callers share the result", async () => {
-    const { store, clock } = await setupPool(["account1"]);
-    const fetchBilling = vi.fn<(apiKey: string) => Promise<BillingSnapshot | undefined>>(async () => ({
-      monthly: 1,
-      purchased: 0,
-      free: 1,
-      periodEnd: BASE_MS + 1,
+    await collect(streamSimple(MODEL, CONTEXT, {
+      apiKey: "host-token",
+      headers: { Authorization: "Bearer host-token" },
     }));
-    const refresher = createBillingRefresher({
-      store,
-      billingCache: createBillingCache({ now: clock.now }),
-      fetchBilling,
-    });
 
-    await Promise.all([
-      refresher("token-account1"),
-      refresher("token-account1"),
-      refresher("token-account1"),
-    ]);
-
-    expect(fetchBilling).toHaveBeenCalledTimes(1);
-    const records = await store.load();
-    expect(records.find((record) => record.id === "account1")?.credits).toBeDefined();
-  });
-
-  it("Given a failing billing fetch, When the refresh runs, Then the refresher never rejects, the store stays untouched, and a later refresh retries", async () => {
-    const { store, clock } = await setupPool(["account1"]);
-    let failing = true;
-    const fetchBilling = vi.fn<(apiKey: string) => Promise<BillingSnapshot | undefined>>(async () => {
-      if (failing) throw new Error("billing offline");
-      return { monthly: 1, purchased: 0, free: 1, periodEnd: BASE_MS + 1 };
-    });
-    const refresher = createBillingRefresher({
-      store,
-      billingCache: createBillingCache({ now: clock.now }),
-      fetchBilling,
-    });
-
-    await expect(refresher("token-account1")).resolves.toBeUndefined();
-    const untouched = await store.load();
-    expect(untouched.find((record) => record.id === "account1")?.credits).toBeUndefined();
-
-    failing = false;
-    await refresher("token-account1");
-    expect(fetchBilling).toHaveBeenCalledTimes(2);
-    const records = await store.load();
-    expect(records.find((record) => record.id === "account1")?.credits).toBeDefined();
-  });
-});
-
-describe("commandcode login persistence", () => {
-  it("Given an unwritable accounts path, When login completes with a valid key, Then the persistence failure fails the login", async () => {
-    const dir = await tempDir();
-    const blocker = join(dir, "not-a-directory");
-    await writeFile(blocker, "regular file, so mkdir below fails", "utf-8");
-    vi.stubEnv("COMMANDCODE_API_BASE", "http://127.0.0.1:1");
-    vi.stubEnv("COMMANDCODE_MODELS_CACHE", join(dir, "models.json"));
-    vi.stubEnv("COMMANDCODE_ACCOUNTS_FILE", join(blocker, "accounts.json"));
-    stubWhoamiApi();
-
-    type Registered = { name: string; config: ProviderConfig };
-    type Host = { registerProvider(name: string, config: ProviderConfig): void };
-    let captured: Registered | undefined;
-    const pi: Host = {
-      registerProvider(name, config) {
-        captured = { name, config };
-      },
-    };
-    await commandcodeExtension(pi);
-    const login = captured?.config.oauth?.login;
-    if (login === undefined) throw new Error("Expected the provider to register oauth login");
-
-    const { onAuth, url: authUrlPromise } = onAuthSignal();
-    const callbacks: OAuthLoginCallbacks = {
-      onAuth,
-      onDeviceCode: () => undefined,
-      onPrompt: async () => "",
-      onSelect: async () => undefined,
-    };
-    const pending = login(callbacks);
-
-    const authUrl = await authUrlPromise;
-    const parsed = new URL(authUrl);
-    const callbackUrl = parsed.searchParams.get("callback") ?? "";
-    const response = await fetch(
-      `${callbackUrl}?${new URLSearchParams({
-        apiKey: "cc-key",
-        state: parsed.searchParams.get("state") ?? "",
-        userId: "u-1",
-        userName: "tester",
-        keyName: "cli",
-      })}`,
-    );
-    expect(response.status).toBe(200);
-
-    await expect(pending).rejects.toThrow(/account pool/i);
-  });
-});
-
-describe("commandcode registerProvider", () => {
-  it("Given fetch is disabled via env, When the extension registers, Then oauth.login is a function, api is anthropic-messages, and models is non-empty", async () => {
-    const dir = await tempDir();
-    vi.stubEnv("COMMANDCODE_API_BASE", "http://127.0.0.1:1");
-    vi.stubEnv("COMMANDCODE_MODELS_CACHE", join(dir, "models.json"));
-    vi.stubEnv("COMMANDCODE_ACCOUNTS_FILE", join(dir, "accounts.json"));
-    vi.stubGlobal("fetch", () => Promise.reject(new Error("fetch disabled")));
-
-    type Registered = { name: string; config: ProviderConfig };
-    type Host = { registerProvider(name: string, config: ProviderConfig): void };
-
-    let captured: Registered | undefined;
-    const pi: Host = {
-      registerProvider(name, config) {
-        captured = { name, config };
-      },
-    };
-
-    await commandcodeExtension(pi);
-
-    expect(captured?.name).toBe("commandcode");
-    expect(captured?.config.name).toBe("Command Code (unofficial)");
-    expect(captured?.config.api).toBe("anthropic-messages");
-    expect(captured?.config.authHeader).toBe(true);
-    // The anthropic-messages adapter appends /v1/messages to the model baseUrl;
-    // registering {apiBase}/provider lands requests on {apiBase}/provider/v1/messages.
-    expect(captured?.config.baseUrl).toBe("http://127.0.0.1:1/provider");
-    expect(captured?.config.models?.length).toBeGreaterThan(0);
-    expect(
-      captured?.config.models?.every(
-        (model) => model.baseUrl === "http://127.0.0.1:1/provider",
-      ),
-    ).toBe(true);
-    expect(captured?.config.oauth?.getApiKey({ access: "k", refresh: "k", expires: 0 })).toBe("k");
+    expect(observed?.apiKey).toBe("token-a1");
+    expect(observed?.headers?.["Authorization"]).toBe("Bearer token-a1");
   });
 });

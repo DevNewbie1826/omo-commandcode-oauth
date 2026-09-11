@@ -1,4 +1,4 @@
-import type { AccountStore } from "./accounts/store.js";
+import type { AccountPool } from "./accounts/pool.js";
 
 export const DEFAULT_API_BASE = "https://api.commandcode.ai";
 export const DEFAULT_BILLING_TTL_MS = 3_600_000;
@@ -48,10 +48,6 @@ function nonNegativeNumberField(record: Record<string, unknown>, key: string): n
     throw new BillingParseError(`Expected ${key} to be a finite non-negative number`);
   }
   return value;
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function isValidPeriodEnd(value: number): boolean {
@@ -198,47 +194,30 @@ export function createBillingCache(
   };
 }
 
-/**
- * Refresh one account's billing state: fetch a snapshot, cache it, and persist
- * the credits into the matching account record so `AccountPool` tier-0
- * selection can see them. The single entry point owns both in-flight dedupe
- * and TTL freshness (`billingCache.get` hit within `COMMANDCODE_BILLING_TTL_MS`
- * skips the fetch). The refresher never rejects — failures are logged and
- * leave the store and cache untouched.
- */
+/** Fetch and cache billing credits in memory. This function never writes account files. */
 export function createBillingRefresher(options: {
-  readonly store: AccountStore;
+  readonly pool: AccountPool;
   readonly billingCache: BillingCache;
   readonly fetchBilling?: (apiKey: string) => Promise<BillingSnapshot | undefined>;
 }): (apiKey: string) => Promise<void> {
   const fetchBilling = options.fetchBilling ?? ((apiKey: string) => fetchBillingSnapshot({ apiKey }));
   const inFlight = new Map<string, Promise<void>>();
   return (apiKey: string): Promise<void> => {
-    if (options.billingCache.get(apiKey) !== undefined) return Promise.resolve();
+    const cached = options.billingCache.get(apiKey);
+    if (cached !== undefined) {
+      options.pool.updateCredits(apiKey, cached);
+      return Promise.resolve();
+    }
     const existing = inFlight.get(apiKey);
     if (existing !== undefined) return existing;
     const task = (async (): Promise<void> => {
       try {
         const snapshot = await fetchBilling(apiKey);
         if (snapshot === undefined || !isValidSnapshot(snapshot)) return;
-        await options.store.mutate((records) =>
-          records.map((record) =>
-            record.token === apiKey
-              ? {
-                  ...record,
-                  credits: {
-                    monthly: snapshot.monthly,
-                    purchased: snapshot.purchased,
-                    free: snapshot.free,
-                    periodEnd: snapshot.periodEnd,
-                  },
-                }
-              : record,
-          ),
-        );
         options.billingCache.set(apiKey, snapshot);
-      } catch (error: unknown) {
-        console.debug(`commandcode: could not refresh pool billing state: ${messageOf(error)}`);
+        options.pool.updateCredits(apiKey, snapshot);
+      } catch (_error: unknown) {
+        return;
       } finally {
         inFlight.delete(apiKey);
       }

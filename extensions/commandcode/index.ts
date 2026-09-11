@@ -3,9 +3,8 @@
  *
  * Registers the "commandcode" provider on the anthropic-messages API with
  * browser OAuth login, a shared multi-account store, and a rate-limit
- * rotating failover transport. Every login credential is added to the
- * shared account pool (`COMMANDCODE_ACCOUNTS_FILE`), so independently
- * logged-in sessions rotate through one pool with per-account cooldowns.
+ * rotating failover transport. Login and logout management are the only
+ * writers of the shared account file; request routing is stateless.
  */
 import { randomUUID } from "node:crypto";
 import type { ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
@@ -26,8 +25,7 @@ import {
   type CommandCodeLogin,
   type WhoamiInfo,
 } from "./oauth.js";
-import { parseCooldown } from "./ratelimit.js";
-import { createFailoverStream, sessionIdFromContext, type StreamSimpleLike } from "./transport.js";
+import { createFailoverStream, type StreamSimpleLike } from "./transport.js";
 
 export { createBillingRefresher };
 
@@ -124,28 +122,6 @@ async function addPoolAccount(store: AccountStore, apiKey: string, whoami: Whoam
   });
 }
 
-/**
- * Resolve a host-pinned `options.apiKey` to a pool account id — but only when
- * that account is healthy per the store: enabled, cooldown (`retryAt`) lapsed,
- * and not already tried. The failover transport resolves the pin once, before
- * any attempt is made, so "not already tried" holds at resolution time; the
- * transport then falls through to normal pool selection whenever this resolver
- * declines an account.
- */
-export function createPinnedAccountResolver(
-  store: AccountStore,
-  now: () => number = Date.now,
-): (token: string) => Promise<string | undefined> {
-  return async (token: string): Promise<string | undefined> => {
-    const records = await store.load();
-    const record = records.find((entry) => entry.token === token);
-    if (record === undefined || !record.enabled) return undefined;
-    const retryAt = record.retryAt;
-    if (retryAt !== undefined && retryAt > now()) return undefined;
-    return record.id;
-  };
-}
-
 function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string): ProviderModelConfig[] {
   return models.map((model) => ({
     id: model.id,
@@ -168,7 +144,15 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
   const store = new AccountStore({ path: resolveAccountsFilePath() });
   const pool = new AccountPool({ store });
   const billingCache = createBillingCache();
-  const refreshBillingSnapshot = createBillingRefresher({ store, billingCache });
+  const refreshBillingSnapshot = createBillingRefresher({ pool, billingCache });
+  void store.load().then(
+    (records) => Promise.all(records.filter((record) => record.enabled).map((record) =>
+      refreshBillingSnapshot(record.token),
+    )),
+    (error: unknown) => {
+      console.debug(`commandcode: could not load accounts for billing polling (${messageOf(error)})`);
+    },
+  );
 
   const failover =
     anthropicStreamSimple === undefined || createEventStream === undefined
@@ -176,16 +160,11 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
       : createFailoverStream({
           anthropicStreamSimple,
           pool,
-          parseCooldown,
-          billingCache,
-          sessionIdFromContext: (context, callOptions) =>
-            callOptions?.sessionId ?? sessionIdFromContext(context),
           createEventStream,
           now: Date.now,
           refreshBilling: (apiKey: string): void => {
             void refreshBillingSnapshot(apiKey);
           },
-          resolveAccountIdByToken: createPinnedAccountResolver(store),
         });
 
   const catalog = await loadModels();
