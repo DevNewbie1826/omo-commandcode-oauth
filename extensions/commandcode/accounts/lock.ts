@@ -1,27 +1,16 @@
 import { createServer, type Server } from "node:net";
-import { resolve } from "node:path";
 import { AccountStoreError } from "./schema.js";
 
 const LOCK_WAIT_MS = 2_000;
 const LOCK_RECHECK_MS = 25;
-// This range is below the usual Linux and Darwin ephemeral ranges. Hash collisions,
-// including an unrelated listener, cause bounded contention rather than a lost write.
-const LOCK_PORT_FIRST = 10_000;
-const LOCK_PORT_COUNT = 20_000;
+// One kernel exclusion domain serializes every Command Code accounts management write,
+// including writes through pathname aliases and writes to different accounts files.
+const ACCOUNTS_MANAGEMENT_LOCK_PORT = 41_059;
 
 function codeOf(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null) return undefined;
   const code = Reflect.get(error, "code");
   return typeof code === "string" ? code : undefined;
-}
-
-function lockPort(accountsPath: string): number {
-  let hash = 0x811c9dc5;
-  for (const byte of Buffer.from(resolve(accountsPath))) {
-    hash ^= byte;
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return LOCK_PORT_FIRST + (hash % LOCK_PORT_COUNT);
 }
 
 function listen(port: number): Promise<Server> {
@@ -49,7 +38,7 @@ function wait(waitMs: number): Promise<void> {
 }
 
 async function acquire(accountsPath: string): Promise<Server> {
-  const port = lockPort(accountsPath);
+  const port = ACCOUNTS_MANAGEMENT_LOCK_PORT;
   const deadline = Date.now() + LOCK_WAIT_MS;
   while (true) {
     try {

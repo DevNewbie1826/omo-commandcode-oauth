@@ -1,5 +1,6 @@
 import { fork, spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createServer, type Server as HttpServer } from "node:http";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,8 +11,16 @@ import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 
 const NOW = 1_700_000_000_000;
 const directories: string[] = [];
+const servers: HttpServer[] = [];
+const children: ChildProcess[] = [];
 
 afterEach(async () => {
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+  await Promise.all(servers.splice(0).map((server) =>
+    new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  ));
   await Promise.all(directories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -27,7 +36,60 @@ type ChildMessage = {
   readonly id: string;
   readonly name?: string;
   readonly message?: string;
+  readonly token?: string;
 };
+
+type MessageInbox = { next(type: ChildMessage["type"]): Promise<ChildMessage> };
+
+function messageInbox(child: ChildProcess): MessageInbox {
+  const queued: ChildMessage[] = [];
+  const waiters: Array<{
+    readonly type: ChildMessage["type"];
+    readonly resolve: (message: ChildMessage) => void;
+    readonly reject: (cause: Error) => void;
+    readonly timer: ReturnType<typeof setTimeout>;
+  }> = [];
+  child.on("message", (message: ChildMessage) => {
+    const index = waiters.findIndex((waiter) => waiter.type === message.type || message.type === "failed");
+    if (index < 0) queued.push(message);
+    else {
+      const waiter = waiters.splice(index, 1)[0]!;
+      clearTimeout(waiter.timer);
+      if (message.type === "failed") waiter.reject(new Error(`${message.name}: ${message.message}`));
+      else waiter.resolve(message);
+    }
+  });
+  child.once("exit", (code) => {
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`Child exited ${code}`));
+    }
+  });
+  return {
+    next(type) {
+      const index = queued.findIndex((message) => message.type === type || message.type === "failed");
+      if (index >= 0) {
+        const message = queued.splice(index, 1)[0]!;
+        return message.type === "failed"
+          ? Promise.reject(new Error(`${message.name}: ${message.message}`))
+          : Promise.resolve(message);
+      }
+      return new Promise((resolve, reject) => {
+        const waiter = {
+          type,
+          resolve,
+          reject,
+          timer: setTimeout(() => {
+            const waiterIndex = waiters.indexOf(waiter);
+            if (waiterIndex >= 0) waiters.splice(waiterIndex, 1);
+            reject(new Error(`Timed out waiting for ${type}`));
+          }, 10_000),
+        };
+        waiters.push(waiter);
+      });
+    },
+  };
+}
 
 function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<ChildMessage> {
   return new Promise((resolve, reject) => {
@@ -79,8 +141,132 @@ async function buildStoreChild(path: string, id: string): Promise<string> {
 async function spawnStoreChild(path: string, id: string): Promise<ChildProcess> {
   const outfile = await buildStoreChild(path, id);
   const child = fork(outfile, { env: { ...process.env, STORE_PATH: path, ACCOUNT_ID: id }, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  children.push(child);
   await nextMessage(child, "ready");
   return child;
+}
+
+async function spawnLoginChild(
+  path: string,
+  id: string,
+  apiBase: string,
+): Promise<{ readonly child: ChildProcess; readonly inbox: MessageInbox }> {
+  const directory = join(path, "..", "login-children");
+  await mkdir(directory, { recursive: true });
+  const outfile = join(directory, `login-child-${id}.mjs`);
+  await build({
+    entryPoints: [join(import.meta.dirname, "../test-support/login-child.ts")],
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    outfile,
+  });
+  const child = fork(outfile, {
+    env: {
+      ...process.env,
+      ACCOUNT_ID: id,
+      COMMANDCODE_ACCOUNTS_FILE: path,
+      COMMANDCODE_API_BASE: apiBase,
+    },
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+  });
+  children.push(child);
+  const inbox = messageInbox(child);
+  await inbox.next("ready");
+  return { child, inbox };
+}
+
+async function startCommandCodeApi(): Promise<string> {
+  const server = createServer((request, response) => {
+    const path = new URL(request.url ?? "/", "http://localhost").pathname;
+    response.setHeader("content-type", "application/json");
+    if (path === "/provider/v1/models") {
+      response.end(JSON.stringify({
+        object: "list",
+        data: [{ id: "claude-sonnet-4-6", name: "Claude", context_length: 200_000 }],
+      }));
+      return;
+    }
+    if (path === "/alpha/whoami") {
+      const token = request.headers.authorization?.replace("Bearer token-", "") ?? "unknown";
+      response.end(JSON.stringify({ user: { id: `user-${token}`, userName: token } }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end("{}");
+  });
+  servers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("Command Code API has no port");
+  return `http://127.0.0.1:${address.port}`;
+}
+
+async function seededPath(name = "accounts.json"): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "commandcode-shared-lock-"));
+  directories.push(dir);
+  const path = join(dir, "real", name);
+  await new AccountStore({ path, now: () => NOW }).add({ id: "seed", token: "token-seed" });
+  return path;
+}
+
+async function aliasPaths(): Promise<readonly { readonly name: string; readonly canonical: string; readonly alias: string }[]> {
+  const canonical = await seededPath();
+  const root = join(canonical, "..", "..");
+  const directoryAlias = join(root, "alias");
+  await symlink(join(root, "real"), directoryAlias, "dir");
+  const aliases = [{ name: "directory symlink", canonical, alias: join(directoryAlias, "accounts.json") }];
+
+  if (canonical.startsWith("/var/")) {
+    const nativeCanonical = await seededPath("native.json");
+    const nativeAlias = `/private${nativeCanonical}`;
+    if (await realpath(nativeAlias) === await realpath(nativeCanonical)) {
+      aliases.push({ name: "/var-private-var", canonical: nativeCanonical, alias: nativeAlias });
+    }
+  } else {
+    const caseCanonical = await seededPath("case.json");
+    const caseAlias = join(caseCanonical, "..", "CASE.JSON");
+    try {
+      if (await realpath(caseAlias) === await realpath(caseCanonical)) {
+        aliases.push({ name: "case alias", canonical: caseCanonical, alias: caseAlias });
+      }
+    } catch (error: unknown) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  return aliases;
+}
+
+async function releaseInOrder(
+  processes: Readonly<Record<"a" | "b", { readonly child: ChildProcess; readonly inbox: MessageInbox }>>,
+  firstId: "a" | "b",
+  secondId: "a" | "b",
+  afterFirst: (result: ChildMessage) => void | Promise<void>,
+): Promise<readonly [ChildMessage, ChildMessage]> {
+  const first = processes[firstId];
+  const second = processes[secondId];
+  const firstRename = first.inbox.next("rename");
+  first.child.send("start");
+  await firstRename;
+  const secondContended = second.inbox.next("contended");
+  second.child.send("start");
+  await secondContended;
+
+  const firstDone = first.inbox.next("done");
+  const secondRename = second.inbox.next("rename");
+  first.child.send("release");
+  const firstResult = await firstDone;
+  await secondRename;
+  await afterFirst(firstResult);
+  const secondDone = second.inbox.next("done");
+  second.child.send("release");
+  return [firstResult, await secondDone];
 }
 
 function lineInbox(child: ChildProcess): { next(type: ChildMessage["type"]): Promise<ChildMessage> } {
@@ -177,6 +363,87 @@ describe("AccountStore management writes", () => {
 
     expect((await new AccountStore({ path }).load()).map((account) => account.id).sort())
       .toEqual(["a", "b"]);
+  });
+
+  it.each([["a", "b"], ["b", "a"]] as const)(
+    "serializes AccountStore aliases in %s/%s publication order",
+    async (firstId, secondId) => {
+      const { canonical, alias } = (await aliasPaths())[0]!;
+      const processes = {
+        a: await spawnStoreChild(canonical, "a"),
+        b: await spawnStoreChild(alias, "b"),
+      };
+      const first = processes[firstId];
+      const second = processes[secondId];
+      const firstRename = nextMessage(first, "rename");
+      first.send("start");
+      await firstRename;
+      const secondContended = nextMessage(second, "contended");
+      second.send("start");
+      await secondContended;
+      const secondRename = nextMessage(second, "rename");
+      const firstDone = nextMessage(first, "done");
+      first.send("release");
+      await firstDone;
+      await secondRename;
+      const secondDone = nextMessage(second, "done");
+      second.send("release");
+      await secondDone;
+
+      expect((await new AccountStore({ path: canonical }).load()).map((account) => account.id))
+        .toEqual(["seed", firstId, secondId]);
+    },
+  );
+
+  it.each([["a", "b"], ["b", "a"]] as const)(
+    "preserves registered oauth.login credentials through aliases in %s/%s publication order",
+    async (firstId, secondId) => {
+      const apiBase = await startCommandCodeApi();
+      for (const paths of await aliasPaths()) {
+        const processes = {
+          a: await spawnLoginChild(paths.canonical, "a", apiBase),
+          b: await spawnLoginChild(paths.alias, "b", apiBase),
+        };
+        const [first, second] = await releaseInOrder(processes, firstId, secondId, async (firstResult) => {
+          expect(firstResult.token, `${paths.name}: first login acknowledgment`).toBe(`token-${firstId}`);
+          expect((await new AccountStore({ path: paths.canonical }).load()).map((account) => account.token),
+            `${paths.name}: fresh load after first acknowledgment`)
+            .toEqual(["token-seed", `token-${firstId}`]);
+        });
+        expect(first.token).toBe(`token-${firstId}`);
+        expect(second.token, `${paths.name}: second login acknowledgment`).toBe(`token-${secondId}`);
+        expect((await new AccountStore({ path: paths.canonical }).load()).map((account) => account.token),
+          `${paths.name}: fresh load after second acknowledgment`)
+          .toEqual(["token-seed", `token-${firstId}`, `token-${secondId}`]);
+      }
+    },
+    30_000,
+  );
+
+  it("serializes writes to different accounts files without losing either file", async () => {
+    const firstPath = await seededPath("first.json");
+    const secondPath = await seededPath("second.json");
+    const a = await spawnStoreChild(firstPath, "a");
+    const b = await spawnStoreChild(secondPath, "b");
+    const aRename = nextMessage(a, "rename");
+    a.send("start");
+    await aRename;
+    const bContended = nextMessage(b, "contended");
+    b.send("start");
+    await bContended;
+    const bRename = nextMessage(b, "rename");
+    const aDone = nextMessage(a, "done");
+    a.send("release");
+    await aDone;
+    await bRename;
+    const bDone = nextMessage(b, "done");
+    b.send("release");
+    await bDone;
+
+    expect((await new AccountStore({ path: firstPath }).load()).map((account) => account.id))
+      .toEqual(["seed", "a"]);
+    expect((await new AccountStore({ path: secondPath }).load()).map((account) => account.id))
+      .toEqual(["seed", "b"]);
   });
 
   it.each([["a", "b"], ["b", "a"]] as const)(
