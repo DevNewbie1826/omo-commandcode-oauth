@@ -42,7 +42,7 @@ async function spawnStoreChild(path: string, id: string): Promise<ChildProcess> 
   const directory = join(path, "..", "children");
   await mkdir(directory, { recursive: true });
   const outfile = join(directory, `store-child-${id}.mjs`);
-  await build({ entryPoints: [join(import.meta.dirname, "fixtures/store-child.ts")], bundle: true, platform: "node", format: "esm", outfile });
+  await build({ entryPoints: [join(import.meta.dirname, "../test-support/store-child.ts")], bundle: true, platform: "node", format: "esm", outfile });
   const child = fork(outfile, { env: { ...process.env, STORE_PATH: path, ACCOUNT_ID: id }, stdio: ["ignore", "ignore", "ignore", "ipc"] });
   await nextMessage(child, "ready");
   return child;

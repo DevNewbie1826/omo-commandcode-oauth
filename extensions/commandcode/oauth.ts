@@ -12,7 +12,6 @@ export const DEFAULT_API_BASE = "https://api.commandcode.ai";
 export const DEFAULT_STUDIO_BASE = "https://commandcode.ai";
 export const DEFAULT_AUTH_TIMEOUT_MS = 120_000;
 export const API_KEY_TTL_MS = 10 * 365 * 24 * 60 * 60 * 1000;
-
 const BRACKETED_PASTE_MARKERS = /(?:\x1b)?\[(?:200|201)~/g;
 const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/g;
 const PASTE_PROMPT = "Browser login did not complete in time. Paste your Command Code API key.";

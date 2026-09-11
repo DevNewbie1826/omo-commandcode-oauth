@@ -16,7 +16,7 @@ import {
 } from "../extensions/commandcode/accounts/pool.js";
 import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 import { createFailoverStream, type StreamSimpleLike } from "../extensions/commandcode/transport.js";
-import { bootRealAdapter } from "./real-adapter.js";
+import { bootRealAdapter } from "../test-support/real-adapter.js";
 
 const NOW = 1_700_000_000_000;
 const MODEL: Model<"anthropic-messages"> = {

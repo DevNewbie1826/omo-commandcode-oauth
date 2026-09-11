@@ -70,6 +70,8 @@ export async function bootRealAdapter(
     })),
   }));
   const base = `http://127.0.0.1:${address.port}`;
+  const previousBase = process.env.COMMANDCODE_API_BASE;
+  const previousAccounts = process.env.COMMANDCODE_ACCOUNTS_FILE;
   process.env.COMMANDCODE_API_BASE = base;
   process.env.COMMANDCODE_ACCOUNTS_FILE = accountsPath;
   const { default: extension } = await import("../extensions/commandcode/index.js");
@@ -101,6 +103,10 @@ export async function bootRealAdapter(
     async close() {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await rm(directory, { recursive: true, force: true });
+      if (previousBase === undefined) delete process.env.COMMANDCODE_API_BASE;
+      else process.env.COMMANDCODE_API_BASE = previousBase;
+      if (previousAccounts === undefined) delete process.env.COMMANDCODE_ACCOUNTS_FILE;
+      else process.env.COMMANDCODE_ACCOUNTS_FILE = previousAccounts;
     },
   };
 }

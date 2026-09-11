@@ -1,5 +1,5 @@
 import { rename } from "node:fs/promises";
-import { AccountStore } from "../../extensions/commandcode/accounts/store.js";
+import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 
 const path = process.env.STORE_PATH;
 const id = process.env.ACCOUNT_ID;
