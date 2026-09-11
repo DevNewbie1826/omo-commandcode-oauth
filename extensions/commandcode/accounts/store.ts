@@ -10,6 +10,7 @@ import {
   type AccountRecord,
   type AccountRecordInput,
 } from "./schema.js";
+import { withAccountLock } from "./lock.js";
 
 const MAX_CAS_ATTEMPTS = 8;
 const pathQueues = new Map<string, Promise<void>>();
@@ -17,6 +18,7 @@ const pathQueues = new Map<string, Promise<void>>();
 export interface AccountStoreOptions {
   readonly path: string;
   readonly now?: () => number;
+  readonly renameImpl?: typeof rename;
 }
 
 export function resolveAccountsFilePath(
@@ -109,7 +111,7 @@ export class AccountStore {
     pathQueues.set(this.options.path, queued);
     await previous;
     try {
-      await this.compareAndSwap(transform);
+      await withAccountLock(this.options.path, () => this.compareAndSwap(transform));
     } finally {
       release();
       if (pathQueues.get(this.options.path) === queued) pathQueues.delete(this.options.path);
@@ -137,7 +139,7 @@ export class AccountStore {
       await this.writeTemporary(temporary, serializeAccountFile(next));
       try {
         if (before !== await this.readRaw()) continue;
-        await rename(temporary, this.options.path);
+        await (this.options.renameImpl ?? rename)(temporary, this.options.path);
         this.records = next;
         return;
       } catch (cause) {

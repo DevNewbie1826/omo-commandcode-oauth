@@ -1,6 +1,8 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { fork, type ChildProcess } from "node:child_process";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { build } from "esbuild";
 import { afterEach, describe, expect, it } from "vitest";
 import { AccountStoreError } from "../extensions/commandcode/accounts/schema.js";
 import { AccountStore } from "../extensions/commandcode/accounts/store.js";
@@ -17,6 +19,33 @@ async function setup(): Promise<{ readonly path: string; readonly store: Account
   directories.push(dir);
   const path = join(dir, "nested", "accounts.json");
   return { path, store: new AccountStore({ path, now: () => NOW }) };
+}
+
+type ChildMessage = { readonly type: "ready" | "rename" | "done" | "failed"; readonly id: string; readonly message?: string };
+
+function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<ChildMessage> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (message: ChildMessage): void => {
+      if (message.type !== type && message.type !== "failed") return;
+      cleanup();
+      if (message.type === "failed") reject(new Error(message.message));
+      else resolve(message);
+    };
+    const onExit = (code: number | null): void => { cleanup(); reject(new Error(`Store child exited ${code}`)); };
+    const cleanup = (): void => { child.off("message", onMessage); child.off("exit", onExit); };
+    child.on("message", onMessage);
+    child.on("exit", onExit);
+  });
+}
+
+async function spawnStoreChild(path: string, id: string): Promise<ChildProcess> {
+  const directory = join(path, "..", "children");
+  await mkdir(directory, { recursive: true });
+  const outfile = join(directory, `store-child-${id}.mjs`);
+  await build({ entryPoints: [join(import.meta.dirname, "fixtures/store-child.ts")], bundle: true, platform: "node", format: "esm", outfile });
+  const child = fork(outfile, { env: { ...process.env, STORE_PATH: path, ACCOUNT_ID: id }, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  await nextMessage(child, "ready");
+  return child;
 }
 
 describe("AccountStore management writes", () => {
@@ -46,6 +75,47 @@ describe("AccountStore management writes", () => {
 
     expect((await new AccountStore({ path }).load()).map((account) => account.id).sort())
       .toEqual(["a", "b"]);
+  });
+
+  it("preserves both acknowledged adds from IPC-gated Node processes", async () => {
+    const { path, store } = await setup();
+    await store.add({ id: "seed", token: "token-seed" });
+    const [a, b] = await Promise.all([spawnStoreChild(path, "a"), spawnStoreChild(path, "b")]);
+    const aRename = nextMessage(a, "rename");
+    const bRename = nextMessage(b, "rename");
+    a.send("start");
+    b.send("start");
+    const first = await Promise.race([aRename, bRename]);
+    const firstChild = first.id === "a" ? a : b;
+    const secondChild = first.id === "a" ? b : a;
+    const lockExists = await stat(`${path}.lock`).then(() => true, () => false);
+    if (!lockExists) await (first.id === "a" ? bRename : aRename);
+    const firstDone = nextMessage(firstChild, "done");
+    firstChild.send("release");
+    await firstDone;
+    if (lockExists) await (first.id === "a" ? bRename : aRename);
+    const secondDone = nextMessage(secondChild, "done");
+    secondChild.send("release");
+    await secondDone;
+
+    expect((await new AccountStore({ path }).load()).map((account) => account.id).sort())
+      .toEqual(["a", "b", "seed"]);
+  });
+
+  it("recovers an exclusive lock left by a killed owner", async () => {
+    const { path } = await setup();
+    const child = await spawnStoreChild(path, "killed");
+    const reachedRename = nextMessage(child, "rename");
+    child.send("start");
+    await reachedRename;
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    child.kill("SIGKILL");
+    await exited;
+    await utimes(`${path}.lock`, new Date(0), new Date(0));
+
+    await expect(new AccountStore({ path }).add({ id: "recovered", token: "token-recovered" }))
+      .resolves.toBeUndefined();
+    await expect(stat(`${path}.lock`)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects duplicate ids and credentials without changing the file", async () => {
