@@ -17,7 +17,7 @@ const API_RESPONSE = {
   ],
 } as const;
 const EXPECTED: readonly CommandCodeModel[] = [
-  { id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", api: "openai-completions", reasoning: false, contextWindow: 1_000_000, maxTokens: 65_536 },
+  { id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", api: "openai-completions", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
   { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", api: "anthropic-messages", reasoning: true, contextWindow: 200_000, maxTokens: 65_536 },
 ];
 function response(body: unknown, status = 200): Response {
@@ -47,13 +47,15 @@ describe("modelsFromApiResponse", () => {
 });
 
 describe("isReasoningModel", () => {
-  it("applies the model-id marker heuristic", () => {
-    const cases = [
-      ["gpt-5.5", true], ["o3-mini", true], ["claude-sonnet-4-6", true],
-      ["zai-org/GLM-5.1", true], ["deepseek-reasoner", true], ["Qwen/QwQ-32B", true],
-      ["foo-think-bar", true], ["Qwen/Qwen3.7-Max", false], ["deepseek/deepseek-v4-flash", false],
+  it("advertises every served model as thinking-capable so the host can send a thinking level", () => {
+    // Live probes accepted `reasoning_effort` on every Command Code family (deepseek, moonshot,
+    // z-ai, qwen, minimax, xiaomi, stepfun, xai, meta, tencent, thinkingmachines); the previous
+    // id-marker heuristic hid the thinking control for all of them.
+    const ids = [
+      "gpt-5.5", "claude-sonnet-4-6", "zai-org/GLM-5.1", "deepseek/deepseek-v4.1-flash",
+      "moonshotai/Kimi-K2.6", "Qwen/Qwen3.7-Max", "google/gemini-3.5-flash", "xai/grok-4.5",
     ] as const;
-    for (const [id, expected] of cases) expect(isReasoningModel(id)).toBe(expected);
+    for (const id of ids) expect(isReasoningModel(id)).toBe(true);
   });
 });
 

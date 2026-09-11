@@ -1,7 +1,15 @@
 export const DEFAULT_MODELS_URL = "https://api.commandcode.ai/provider/v1/models";
 const MAX_TOKENS = 65_536;
 const MAX_CONTEXT = 10_000_000;
-const REASONING_MARKERS = ["gpt", "o3", "claude", "glm", "deepseek-reasoner", "qwq", "think"] as const;
+/**
+ * Command Code accepts a thinking request for every model family it serves: live probes against
+ * `/provider/v1/chat/completions` with `reasoning_effort: "high"` returned success for deepseek,
+ * moonshot, z-ai, qwen, minimax, xiaomi, stepfun, xai, meta, tencent and thinkingmachines ids
+ * (only out-of-plan models failed, with a plan error rather than a parameter rejection), and the
+ * anthropic route carries thinking natively. Advertising a model as non-reasoning makes the host
+ * withhold the thinking level entirely, so the catalog marks every model reasoning-capable and
+ * lets the upstream error surface verbatim if a specific model ever refuses the parameter.
+ */
 
 export type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -42,9 +50,8 @@ export class ModelsFetchError extends Error {
   }
 }
 
-export function isReasoningModel(id: string): boolean {
-  const haystack = id.toLowerCase();
-  return REASONING_MARKERS.some((marker) => haystack.includes(marker));
+export function isReasoningModel(_id: string): boolean {
+  return true;
 }
 
 export function apiForModel(id: string): CommandCodeApi {
