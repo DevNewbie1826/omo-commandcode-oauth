@@ -265,6 +265,62 @@ describe("installed anthropic adapter boundary", () => {
     }
   });
 
+  it("keeps final tool-choice compatibility replay within [a1,a2,a1]", async () => {
+    const third = "{\n  \"error\": {\"type\":\"invalid_request_error\", \"message\":\"tool_choice is not supported by this model\"}\n}\n";
+    const fourth = "{\n \"error\":{\"type\":\"authentication_error\", \"message\":\"fourth-wire-response\"}\n}\n";
+    const harness = await bootRealAdapter((request) => {
+      if (harness.attempts.length < 3) {
+        request.respond(429, '{"error":{"type":"rate_limit_error","message":"limited"}}', {
+          "retry-after": "0",
+        });
+      } else if (harness.attempts.length === 3) request.respond(400, third);
+      else request.respond(401, fourth);
+    });
+    try {
+      const terminal = (await harness.request({
+        maxRetries: 0,
+        onPayload: (payload) => ({
+          ...(payload as Record<string, unknown>),
+          tools: [{ name: "echo", description: "Echo", input_schema: {
+            type: "object", properties: {}, required: [],
+          } }],
+          tool_choice: { type: "any" },
+        }),
+      })).at(-1);
+      expect(harness.attempts).toEqual(["a1", "a2", "a1"]);
+      expect(terminal).toMatchObject({
+        type: "error",
+        error: { upstreamStatus: 400, upstreamBody: third, errorMessage: third },
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("does not double alternating forced-tool fallback ring entries", async () => {
+    const unsupported = '{"error":{"type":"rate_limit_error","message":"tool_choice is not supported by this model"}}';
+    const harness = await bootRealAdapter((request) => {
+      if (harness.attempts.length % 2 === 1) request.respond(400, unsupported);
+      else request.respond(429, '{"error":{"type":"rate_limit_error","message":"limited"}}', {
+        "retry-after": "0",
+      });
+    });
+    try {
+      await harness.request({
+        onPayload: (payload) => ({
+          ...(payload as Record<string, unknown>),
+          tools: [{ name: "echo", description: "Echo", input_schema: {
+            type: "object", properties: {}, required: [],
+          } }],
+          tool_choice: { type: "any" },
+        }),
+      });
+      expect(harness.attempts).toEqual(["a1", "a2", "a1"]);
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("surfaces the byte-exact final 429 body without an adapter retry marker", async () => {
     const bodies = new Map<string, string>();
     const harness = await bootRealAdapter((request) => {

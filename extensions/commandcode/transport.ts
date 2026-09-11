@@ -12,20 +12,13 @@ import type { AccountPool } from "./accounts/pool.js";
 import { classifyFailure, type ClassifyFailureInput } from "./ratelimit.js";
 
 const ZERO_USAGE: Usage = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
+  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 export type StreamSimpleResult = AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
-export type StreamSimpleLike = (
-  model: Model<"anthropic-messages">,
-  context: Context,
-  options?: SimpleStreamOptions,
-) => StreamSimpleResult;
+export type StreamSimpleLike = (model: Model<"anthropic-messages">, context: Context,
+  options?: SimpleStreamOptions) => StreamSimpleResult;
 export type FailoverStreamSimple = (
   model: Model<Api>,
   context: Context,
@@ -39,9 +32,7 @@ export interface FailoverStreamOptions {
   readonly refreshBilling?: (apiKey: string) => void;
 }
 
-type UpstreamResponseFailure = Readonly<{
-  status: number; body: string; headers: Readonly<Record<string, string>>;
-}>;
+type UpstreamResponseFailure = Readonly<{ status: number; body: string; headers: Readonly<Record<string, string>> }>;
 
 type Failure = {
   readonly classification: ClassifyFailureInput;
@@ -126,13 +117,22 @@ function eventFailure(
   };
 }
 function recordingFetch(baseFetch: typeof fetch, record: (failure: UpstreamResponseFailure) => void): typeof fetch {
+  let firstResponse: Promise<Response> | undefined;
+  let failure: UpstreamResponseFailure | undefined;
   return async (input, init) => {
-    const response = await baseFetch(input, init);
-    if (!response.ok) {
-      const body = await response.clone().text();
-      record({ status: response.status, body, headers: Object.fromEntries(response.headers) });
-    }
-    return response;
+    const initial = firstResponse === undefined;
+    firstResponse ??= baseFetch(input, init).then(async (response) => {
+      if (!response.ok) {
+        const body = await response.clone().text();
+        failure = { status: response.status, body, headers: Object.fromEntries(response.headers) };
+        record(failure);
+      }
+      return response;
+    });
+    const response = await firstResponse;
+    if (initial) return response;
+    if (failure === undefined) return baseFetch(input, init);
+    return new Response(failure.body, { status: failure.status, headers: failure.headers });
   };
 }
 function isAnthropicMessagesModel(model: Model<Api>): model is Model<"anthropic-messages"> {
