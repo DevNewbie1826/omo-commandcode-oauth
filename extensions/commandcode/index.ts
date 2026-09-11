@@ -115,6 +115,8 @@ function toProviderModels(models: readonly CommandCodeModel[], apiBase: string):
     name: model.name,
     api: model.api,
     reasoning: model.reasoning,
+    // Claude models must omit the field entirely so native tier inference keeps owning it.
+    ...(model.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: model.thinkingLevelMap }),
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.contextWindow,
