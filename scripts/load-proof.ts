@@ -12,7 +12,6 @@ interface RegisteredProvider {
 const workspace = await mkdtemp(join(tmpdir(), "commandcode-load-proof-"));
 // Force model loading through the static fallback without network access.
 process.env["COMMANDCODE_API_BASE"] = "http://127.0.0.1:1";
-process.env["COMMANDCODE_MODELS_CACHE"] = join(workspace, "models.json");
 process.env["COMMANDCODE_ACCOUNTS_FILE"] = join(workspace, "accounts.json");
 
 const { default: commandcodeExtension } = await import("../extensions/commandcode/index.js");

@@ -66,7 +66,6 @@ Command Code API 키는 만료되지 않습니다. 내부적으로는 10년짜�
 | `COMMANDCODE_ACCOUNTS_FILE` | `~/.commandcode/omo-accounts.json` | 멀티 계정 자격 증명 파일 경로. |
 | `COMMANDCODE_EXPIRY_WINDOW_MS` | `86400000` (24시간) | Tier 0로 분류할 과금 주기 종료 임박 창(ms). 양의 정수가 아니면 에러를 던집니다. |
 | `COMMANDCODE_BILLING_TTL_MS` | `3600000` (1시간) | 계정별 크레딧 스냅샷의 인메모리 캐시 TTL(ms). |
-| `COMMANDCODE_MODELS_CACHE` | `~/.commandcode/omo-models.json` | 모델 카탈로그 캐시 파일 경로. |
 
 ## 계정 파일
 
@@ -108,11 +107,10 @@ Command Code API 키는 만료되지 않습니다. 내부적으로는 10년짜�
 
 ## 모델 카탈로그
 
-모델 목록은 하드코딩되어 있지 않고 다음과 같이 관리됩니다.
+모델 목록은 프로세스 메모리에서만 관리됩니다.
 
-- **동적 조회**: `GET https://api.commandcode.ai/provider/v1/models`(OpenAI 스타일 `list` 응답)에서 최신 목록을 가져옵니다.
-- **로컬 캐시**: 가져온 목록은 `~/.commandcode/omo-models.json`에 24시간 TTL로 캐시됩니다. 오프라인으로 재시작해도 마지막 목록을 그대로 씁니다.
-- **정적 폴백**: 라이브 조회와 캐시가 모두 실패하면 내장된 정적 목록(`claude-sonnet-4-6`, `gpt-5.5`, `deepseek/deepseek-v4-flash`, `zai-org/GLM-5.1`)을 노출해 모델이 0개가 되는 일이 없습니다.
+- **동적 조회**: 시작할 때 `GET https://api.commandcode.ai/provider/v1/models`(OpenAI 스타일 `list` 응답)에서 최신 목록을 가져옵니다. 디스크에는 기록하지 않습니다.
+- **정적 폴백**: 라이브 조회가 실패하면 내장된 정적 목록(`claude-sonnet-4-6`, `gpt-5.5`, `deepseek/deepseek-v4-flash`, `zai-org/GLM-5.1`)을 노출해 모델이 0개가 되는 일이 없습니다.
 
 ## 동작 원리
 
@@ -132,7 +130,7 @@ Command Code 공식 CLI(1.53.0)의 로그인 플로우를 재현합니다. 최�
 omo remove git:github.com/DevNewbie1826/omo-commandcode-oauth
 ```
 
-계정 파일(`~/.commandcode/omo-accounts.json`)과 모델 캐시(`~/.commandcode/omo-models.json`)는 남습니다. 완전히 지우려면 직접 삭제하세요.
+계정 파일(`~/.commandcode/omo-accounts.json`)은 남습니다. 완전히 지우려면 직접 삭제하세요.
 
 ## 라이선스
 
