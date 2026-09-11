@@ -24,9 +24,12 @@ const MAX_CONTEXT = 10_000_000;
  * unrelated families — deepseek/deepseek-v4.1-flash, moonshotai/Kimi-K2.6, zai-org/GLM-5.2,
  * Qwen/Qwen3.8-Flash, xai/grok-4.5, MiniMaxAI/MiniMax-M2.5 — each with minimal=400 and the other
  * five=200. "minimal" maps to "low", its nearest accepted value; "off" stays unmapped so the host
- * keeps exposing it while the adapter simply omits reasoning_effort. Every exposed tier must be
- * defined here: the host drops any level whose mapped value is null or missing and gates
- * xhigh/max through the map, so a partial map would hide tiers the gateway accepts.
+ * keeps exposing it while the adapter simply omits reasoning_effort. Host semantics are precise here:
+ * an explicit null value hides that one ordinary level, but merely omitting an ordinary level does
+ * not hide it (a partial map like {high: "high"} still yields off/minimal/low/medium/high). The
+ * extended tiers work differently: once any map exists, supportsXhigh and supportsMax each require
+ * their key to be present and non-null, so omitting xhigh or max disables exactly that tier. That
+ * is why this map must pin both extended tiers explicitly.
  */
 const MEASURED_THINKING_LEVEL_MAP: ThinkingLevelMap = {
   minimal: "low",
@@ -89,7 +92,10 @@ export function apiForModel(id: string): CommandCodeApi {
 /**
  * Claude models never carry a thinkingLevelMap: their tiers are unmeasurable on this plan (every
  * claude model answers 403 MODEL_NOT_IN_PLAN) and the host's native inference already exposes max
- * for claude-sonnet-5, opus-* and fable-5 — a partial map would disable those tiers.
+ * for the measured claude ids (supportsMax=true for claude-opus-4-6, claude-opus-5, claude-fable-5
+ * and claude-sonnet-5, though claude-opus-4-1 measured false). The catalog object literally carries
+ * thinkingLevelMap: undefined, while the registration path in index.ts omits the key entirely for
+ * claude models via its conditional spread, so native inference keeps owning these tiers.
  */
 function catalogModel(id: string, name: string, contextWindow: number): CommandCodeModel {
   const api = apiForModel(id);

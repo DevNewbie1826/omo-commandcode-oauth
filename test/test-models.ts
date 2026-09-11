@@ -76,8 +76,9 @@ describe("thinkingLevelMap", () => {
 
     expect(models[0]?.thinkingLevelMap).toEqual({ ...MEASURED_THINKING_LEVEL_MAP });
     expect(models[1]?.thinkingLevelMap).toEqual({ ...MEASURED_THINKING_LEVEL_MAP });
-    // The map must pin exactly the six gateway tiers; "off" stays unmapped so the
-    // host keeps exposing it and the adapter merely omits reasoning_effort.
+    // The map must pin exactly the six host reasoning levels, translated onto the five values the
+    // gateway accepts (it rejects "minimal"); "off" stays unmapped so the host keeps exposing it
+    // and the adapter merely omits reasoning_effort.
     expect(Object.keys(models[0]?.thinkingLevelMap ?? {}).sort())
       .toEqual(["high", "low", "max", "medium", "minimal", "xhigh"]);
   });

@@ -119,7 +119,7 @@ Command Code 게이트웨이가 받아들이는 `reasoning_effort` 값은 정확
 - 실제 키로 `POST https://api.commandcode.ai/provider/v1/chat/completions`에 `reasoning_effort: "minimal"`을 내면 HTTP 400과 함께 게이트웨이 스스로 허용 집합을 열거하는 오류를 반환합니다: `Invalid option: expected one of "low"|"medium"|"high"|"xhigh"|"max"` (type `invalid_request_error`, param `reasoning_effort`).
 - 같은 다섯 값은 서로 무관한 여섯 모델 패밀리(`deepseek/deepseek-v4.1-flash`, `moonshotai/Kimi-K2.6`, `zai-org/GLM-5.2`, `Qwen/Qwen3.8-Flash`, `xai/grok-4.5`, `MiniMaxAI/MiniMax-M2.5`)에서 모두 HTTP 200으로 확인됐습니다.
 
-그래서 OpenAI 경로 모델은 명시적인 추론 수준 맵을 등록합니다. 호스트에 노출되는 `minimal`은 게이트웨이가 거부하므로 `low`로 바꿔 보내고, 나머지 `low`/`medium`/`high`/`xhigh`/`max`는 그대로 전달합니다. 이전에는 맵이 없어서 라이브러리가 하드코딩된 모델 ID 허용 목록으로 수준을 결정했는데, Command Code의 모델 ID와 일치하지 않아 모든 OpenAI 경로 모델에서 `xhigh`와 `max`가 숨겨지고 오히려 게이트웨이가 거부하는 `minimal`이 노출되는 문제가 있었습니다.
+그래서 OpenAI 경로 모델은 명시적인 추론 수준 맵을 등록합니다. 호스트에 노출되는 `minimal`은 게이트웨이가 거부하므로 `low`로 바꿔 보내고, 나머지 `low`/`medium`/`high`/`xhigh`/`max`는 그대로 전달합니다. 이전에는 맵이 없어서 라이브러리가 하드코딩된 모델 ID 추론으로 수준을 결정했는데, 그 추론이 불완전하고 일관성이 없었습니다. `gpt-5.5`와 `deepseek/deepseek-v4-flash`에서는 `xhigh`가 이미 노출됐고 `gpt-5.6-sol`에서는 `xhigh`와 `max`가 모두 노출됐지만, Command Code의 실제 모델 ID(`deepseek/deepseek-v4.1-flash`, `moonshotai/Kimi-K2.6`, `zai-org/GLM-5.2`, `xai/grok-4.5` 등)와 일치하지 않아 이 ID들에서는 수준이 `off`/`minimal`/`low`/`medium`/`high`만 노출되고(`supportsXhigh=false`, `supportsMax=false`) 오히려 게이트웨이가 거부하는 `minimal`이 끼어 있는 문제가 있었습니다.
 
 claude 모델은 이 플랜에서 전부 403 `MODEL_NOT_IN_PLAN`을 반환하므로 Anthropic 경로 수준을 실측할 수 없습니다. 따라서 claude 모델은 업스트림 라이브러리의 기본 추론 그대로 둡니다.
 
