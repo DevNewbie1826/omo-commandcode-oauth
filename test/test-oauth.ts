@@ -432,4 +432,18 @@ describe("createLogin key validation", () => {
     closeServer(server);
   });
 
+  test("Given the studio posts urlencoded credentials, When POST /callback carries a form body, Then waitForCallback resolves them", async () => {
+    const { server, port, waitForCallback } = await startAuthServer({ expectedState: "st" });
+    OPEN_SERVERS.push(server);
+    const res = await fetch(`http://127.0.0.1:${port}/callback`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://commandcode.ai" },
+      body: new URLSearchParams({ apiKey: "user_formed", state: "st", userId: "u2", userName: "Former", keyName: "cli" }).toString(),
+    });
+    expect([200, 204]).toContain(res.status);
+    const creds = await waitForCallback;
+    expect(creds).toMatchObject({ apiKey: "user_formed", state: "st", userId: "u2", userName: "Former", keyName: "cli" });
+    closeServer(server);
+  });
+
 });

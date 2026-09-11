@@ -247,6 +247,7 @@ export async function startAuthServer(options: StartAuthServerOptions): Promise<
       return;
     }
     const originHeader = typeof request.headers.origin === "string" ? request.headers.origin : null;
+
     const cors = corsHeaders(originHeader);
 
     if (request.method === "OPTIONS") {
@@ -267,16 +268,50 @@ export async function startAuthServer(options: StartAuthServerOptions): Promise<
 
     const query = parsed.searchParams;
 
+    const bodyReady = new Promise<string>((resolve) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      request.on("data", (chunk: Buffer) => {
+        size += chunk.byteLength;
+        if (size > MAX_BODY_BYTES) {
+          request.destroy();
+          resolve("");
+          return;
+        }
+        chunks.push(chunk);
+      });
+      request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      request.on("error", () => resolve(""));
+    });
+
     const respondPage = (status: number, body: string, onDone: () => void): void => {
       response.writeHead(status, { "Content-Type": "text/html; charset=utf-8", ...cors });
       response.end(body, onDone);
     };
 
     void (async () => {
+      const capturedBody = await bodyReady;
       let params: CallbackParams = paramsFromQuery(query);
-      if (request.method === "POST") {
-        const bodyParams = await paramsFromBody(request);
-        if (bodyParams !== null) params = bodyParams;
+      if (request.method === "POST" && capturedBody !== "") {
+        const contentType = String(request.headers["content-type"] ?? "");
+        const pickFrom = (get: (key: string) => string | null) => ({
+          apiKey: get("apiKey"),
+          state: get("state"),
+          userId: get("userId"),
+          userName: get("userName"),
+          keyName: get("keyName"),
+          error: get("error") ?? undefined,
+          error_description: get("error_description") ?? undefined,
+        });
+        if (contentType.includes("application/x-www-form-urlencoded")) {
+          const form = new URLSearchParams(capturedBody);
+          params = pickFrom((key) => form.get(key));
+        } else {
+          try {
+            const parsed = JSON.parse(capturedBody) as Record<string, unknown>;
+            params = pickFrom((key) => (typeof parsed[key] === "string" ? parsed[key] : null));
+          } catch {}
+        }
       }
 
       const errorCode = params.error ?? queryValue(query, "error") ?? undefined;
