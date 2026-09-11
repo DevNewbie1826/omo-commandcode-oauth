@@ -54,6 +54,7 @@ if (hostRoot === undefined) {
 const piAiDist = join(hostRoot, "node_modules/@earendil-works/pi-ai/dist");
 const entries = {
   compat: join(piAiDist, "compat.js"),
+  models: join(piAiDist, "models.js"),
   oauth: join(piAiDist, "oauth.js"),
   providers: join(piAiDist, "providers/all.js"),
   senpi: join(hostRoot, "dist/index.js"),
@@ -109,6 +110,18 @@ try {
   if (registration.name !== "commandcode") problems.push(`unexpected provider ${registration.name}`);
   if (typeof registration.config["streamSimple"] !== "function") problems.push("streamSimple is not a function");
 
+  type HostModel = Record<string, unknown>;
+  type HostModels = {
+    getSupportedThinkingLevels(model: HostModel): string[];
+    supportsXhigh(model: HostModel): boolean;
+    supportsMax(model: HostModel): boolean;
+  };
+  const hostModels = await jiti.import<unknown>(entries.models) as HostModels;
+  if (typeof hostModels.getSupportedThinkingLevels !== "function" ||
+      typeof hostModels.supportsXhigh !== "function" || typeof hostModels.supportsMax !== "function") {
+    throw new Error("host models module does not expose thinking-level functions");
+  }
+
   const models = registration.config["models"];
   let anthropic = 0;
   let openai = 0;
@@ -120,11 +133,32 @@ try {
         problems.push("invalid model entry");
         continue;
       }
-      const claude = value["id"].toLowerCase().startsWith("claude");
+      const modelId = value["id"];
+      const claude = modelId.toLowerCase().startsWith("claude");
       const expectedApi = claude ? "anthropic-messages" : "openai-completions";
       const expectedBase = claude ? `${API_BASE}/provider` : `${API_BASE}/provider/v1`;
-      if (value["api"] !== expectedApi) problems.push(`bad api for ${value["id"]}`);
-      if (value["baseUrl"] !== expectedBase) problems.push(`bad baseUrl for ${value["id"]}`);
+      if (value["api"] !== expectedApi) problems.push(`bad api for ${modelId}`);
+      if (value["baseUrl"] !== expectedBase) problems.push(`bad baseUrl for ${modelId}`);
+      const model = { ...value, provider: "commandcode", api: expectedApi };
+      const levels = hostModels.getSupportedThinkingLevels(model);
+      if (!claude) {
+        if (!hostModels.supportsXhigh(model)) throw new Error(`openai supportsXhigh assertion failed for ${modelId}`);
+        if (!hostModels.supportsMax(model)) throw new Error(`openai supportsMax assertion failed for ${modelId}`);
+        if (!levels.includes("xhigh") || !levels.includes("max")) {
+          throw new Error(`openai supported tiers assertion failed for ${modelId}`);
+        }
+        const thinkingLevelMap = value["thinkingLevelMap"];
+        if (!isRecord(thinkingLevelMap) || thinkingLevelMap["minimal"] !== "low") {
+          throw new Error(`openai minimal map assertion failed for ${modelId}`);
+        }
+      } else {
+        if (Object.prototype.hasOwnProperty.call(value, "thinkingLevelMap")) {
+          throw new Error(`claude thinkingLevelMap omission assertion failed for ${modelId}`);
+        }
+        if (modelId === "claude-sonnet-5" && !hostModels.supportsMax(model)) {
+          throw new Error(`claude native max assertion failed for ${modelId}`);
+        }
+      }
       if (claude) anthropic += 1;
       else openai += 1;
     }
@@ -132,10 +166,16 @@ try {
   if (anthropic === 0 || openai === 0) problems.push("both model routes were not registered");
   if (problems.length > 0) throw new Error(problems.join("; "));
 
+  const openaiSample = Array.isArray(models) ? models.find((value) =>
+    isRecord(value) && value["api"] === "openai-completions" && typeof value["id"] === "string",
+  ) : undefined;
+  const sampleTiers = isRecord(openaiSample)
+    ? hostModels.getSupportedThinkingLevels({ ...openaiSample, provider: "commandcode", api: "openai-completions" }).join(",")
+    : "none";
   console.log(
     `host-load-proof: PASS provider=${registration.name} registrations=${registrations.length} ` +
       `streamSimple=${typeof registration.config["streamSimple"]} ` +
-      `anthropic=${anthropic} openai=${openai} host=${hostRoot}`,
+      `anthropic=${anthropic} openai=${openai} openaiTiers=${sampleTiers} host=${hostRoot}`,
   );
 } catch (error: unknown) {
   console.error(`host-load-proof: FAILED (${error instanceof Error ? error.message : String(error)})`);
