@@ -1,10 +1,60 @@
 import { access, cp, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createJiti } from "jiti/static";
 
 const SENPI_PACKAGE = "@code-yeongyu/senpi";
 const API_BASE = "http://127.0.0.1:1";
+const CLAUDE_SONNET_5_ID = "claude-sonnet-5";
+
+/**
+ * Deterministic registered-catalog fixture. The static fallback catalog deliberately does not
+ * contain claude-sonnet-5 (an unmeasured production default must not ship just to exercise a
+ * proof), so a second registration pass is served by this loopback endpoint instead: the script
+ * fully controls the catalog it asserts against, offline.
+ */
+const FIXTURE_MODELS_RESPONSE = {
+  object: "list",
+  data: [
+    { id: CLAUDE_SONNET_5_ID, name: CLAUDE_SONNET_5_ID, context_length: 200_000 },
+    { id: "gpt-5.5", name: "gpt-5.5", context_length: 200_000 },
+  ],
+};
+
+function startFixtureServer(): Promise<{ readonly server: Server; readonly url: string }> {
+  const server = createServer((request, response) => {
+    const path = (request.url ?? "").split("?")[0];
+    if (request.method === "GET" && path === "/provider/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(FIXTURE_MODELS_RESPONSE));
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ object: "error", message: `unexpected fixture request ${request.method} ${path}` }));
+  });
+  return new Promise((resolveStarted, rejectStarted) => {
+    server.once("error", rejectStarted);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        server.close();
+        rejectStarted(new Error("fixture server did not bind to a TCP port"));
+        return;
+      }
+      resolveStarted({ server, url: `http://127.0.0.1:${address.port}` });
+    });
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolveClosed, rejectClosed) => {
+    server.close((error: Error | undefined) => {
+      if (error !== undefined) rejectClosed(error);
+      else resolveClosed();
+    });
+  });
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -155,9 +205,6 @@ try {
         if (Object.prototype.hasOwnProperty.call(value, "thinkingLevelMap")) {
           throw new Error(`claude thinkingLevelMap omission assertion failed for ${modelId}`);
         }
-        if (modelId === "claude-sonnet-5" && !hostModels.supportsMax(model)) {
-          throw new Error(`claude native max assertion failed for ${modelId}`);
-        }
       }
       if (claude) anthropic += 1;
       else openai += 1;
@@ -165,6 +212,51 @@ try {
   }
   if (anthropic === 0 || openai === 0) problems.push("both model routes were not registered");
   if (problems.length > 0) throw new Error(problems.join("; "));
+
+  // Second registration against the loopback fixture above: the claude-sonnet-5 native-max
+  // assertion is reachable here and fails loudly, instead of being vacuous against a static
+  // fallback catalog that never contains that id.
+  const fixture = await startFixtureServer();
+  try {
+    process.env["COMMANDCODE_API_BASE"] = fixture.url;
+    const fixtureRegistrations: Array<{ readonly name: string; readonly config: Record<string, unknown> }> = [];
+    await extension({
+      registerProvider(name: unknown, config: unknown): void {
+        if (typeof name !== "string" || !isRecord(config)) throw new Error("invalid fixture provider registration");
+        fixtureRegistrations.push({ name, config });
+      },
+    });
+    const fixtureRegistration = fixtureRegistrations[0];
+    if (fixtureRegistrations.length !== 1 || fixtureRegistration === undefined) {
+      throw new Error(`fixture pass expected one provider, got ${fixtureRegistrations.length}`);
+    }
+    const fixtureModels = fixtureRegistration.config["models"];
+    if (!Array.isArray(fixtureModels)) throw new Error("fixture pass models is not an array");
+    const registeredIds = fixtureModels.map((value) =>
+      isRecord(value) && typeof value["id"] === "string" ? value["id"] : String(value),
+    );
+    if (!fixtureModels.some((value) => isRecord(value) && value["api"] === "openai-completions")) {
+      throw new Error(`fixture catalog has no openai-route model (registered: ${registeredIds.join(",")})`);
+    }
+    const claudeSonnet5 = fixtureModels.find(
+      (value): value is Record<string, unknown> => isRecord(value) && value["id"] === CLAUDE_SONNET_5_ID,
+    );
+    if (claudeSonnet5 === undefined) {
+      throw new Error(`fixture catalog is missing ${CLAUDE_SONNET_5_ID} (registered: ${registeredIds.join(",")})`);
+    }
+    if (Object.prototype.hasOwnProperty.call(claudeSonnet5, "thinkingLevelMap")) {
+      throw new Error(
+        `${CLAUDE_SONNET_5_ID} carries an own thinkingLevelMap; native tier inference must own its levels`,
+      );
+    }
+    const claudeModel = { ...claudeSonnet5, provider: "commandcode", api: "anthropic-messages" };
+    if (!hostModels.supportsMax(claudeModel)) {
+      throw new Error(`${CLAUDE_SONNET_5_ID} native max assertion failed: host supportsMax reported false`);
+    }
+  } finally {
+    await closeServer(fixture.server);
+    process.env["COMMANDCODE_API_BASE"] = API_BASE;
+  }
 
   const openaiSample = Array.isArray(models) ? models.find((value) =>
     isRecord(value) && value["api"] === "openai-completions" && typeof value["id"] === "string",
@@ -175,7 +267,7 @@ try {
   console.log(
     `host-load-proof: PASS provider=${registration.name} registrations=${registrations.length} ` +
       `streamSimple=${typeof registration.config["streamSimple"]} ` +
-      `anthropic=${anthropic} openai=${openai} openaiTiers=${sampleTiers} host=${hostRoot}`,
+      `anthropic=${anthropic} openai=${openai} openaiTiers=${sampleTiers} claudeSonnet5NativeMax=true host=${hostRoot}`,
   );
 } catch (error: unknown) {
   console.error(`host-load-proof: FAILED (${error instanceof Error ? error.message : String(error)})`);
