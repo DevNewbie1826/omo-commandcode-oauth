@@ -50,15 +50,12 @@ Command Code API 키는 만료되지 않습니다. 내부적으로는 10년짜�
 
 ## 멀티 계정 회전 규칙
 
-계정 풀은 티어와 세션 고정(sticky)을 조합해 계정을 고릅니다.
-
-- **건강한 계정**: 활성화(`enabled`)되어 있고, 쿨다운(`retryAt`)이 지났거나 없는 계정.
-- **Tier 0 (만료 임박 크레딧 우선)**: 크레딧 스냅샷이 있고, `monthly + free` 크레딧이 남아 있으며, 과금 주기 종료(`periodEnd`)가 `COMMANDCODE_EXPIRY_WINDOW_MS`(기본 24시간) 이내로 다가온 계정. `periodEnd` 오름차순으로 정렬되어 **가장 먼저 소멸하는 크레딧부터** 소진합니다. 월간/무료 크레딧은 주기가 끝나면 사라지는(use-it-or-lose-it) 크레딧이라, 버려지기 전에 먼저 씁니다.
-- **Tier 1**: 그 외 건강한 계정 전부. 계정 파일에 적힌 순서(추가 순서)대로 사용합니다.
-- **Sticky**: 세션 ID에 한번 바인딩된 계정은 건강한 동안 계속 유지됩니다. 대화 도중 계정이 바뀌어 컨텍스트가 흔들리는 일이 없습니다.
-- **429 / RATE_LIMITED**: 응답이 레이트리밋이면 해당 계정을 리셋 시각까지 쿨다운(격리)하고 **다음 계정으로 즉시 재시도**합니다. 쿨다운 시각은 `rateLimit.reset`(unix 초), 메시지의 `resets at <ISO>`, `Retry-After` 헤더 순으로 해석합니다. 쿨다운은 올리기만 하고 내리지 않으며, 격리된 계정의 세션 바인딩은 해제됩니다.
-- **전부 쿨다운**: 건강한 계정이 하나도 없으면 재시도하지 않고 레이트리밋 에러를 그대로 반환합니다. 회전 커서는 없어서, 쿨다운이 풀리면 자연스럽게 티어 순서의 첫 계정(크레딧 정보가 없으면 1번 계정)으로 돌아갑니다.
-- **출력 후 재시도 금지**: 스트림이 첫 이벤트를 내보낸 뒤 실패하면 다른 계정으로 재시도하지 않습니다. 이미 사용자에게 출력이 시작된 응답을 다른 계정으로 이어 쓰면 내용이 섞이기 때문입니다.
+- **시작 순서**: 활성 계정 중 `monthly + free > 0`이고 `periodEnd`가 앞으로 `COMMANDCODE_EXPIRY_WINDOW_MS`(기본 24시간) 안에 있는 계정을 먼저 `periodEnd` 오름차순으로 둡니다(Tier 0). 나머지는 파일 순서를 유지합니다. 빌링 조회 결과는 메모리에만 보관하며, 파일에 이미 있는 `credits`는 시작 힌트로만 읽습니다.
+- **스테이트리스 링**: 모든 요청은 항상 정렬된 1번 계정부터 시작합니다. 첫 출력 전에 429, `RATE_LIMITED`, `rate_limit_error`, 5xx 또는 네트워크 오류가 나면 다음 계정으로 이동합니다.
+- **마지막 한 번**: 마지막 계정까지 실패하면 1번 계정을 정확히 한 번 더 시도합니다. 이 시도도 실패하면 그 시도의 HTTP 상태와 본문을 수정하거나 감싸지 않고 원문 그대로 전달합니다. N개 계정이 모두 실패할 때 시도 순서는 `[1, 2, ..., N, 1]`입니다.
+- **인증 오류 즉시 전파**: 401/403 인증 오류는 어느 계정에서 발생하든 다른 계정을 시도하지 않고 원문 그대로 즉시 전달합니다.
+- **출력 후 재시도 금지**: 첫 출력 이벤트가 전달된 뒤의 실패는 재생하거나 재시도하지 않고 그대로 전달합니다.
+- **요청 간 상태 없음**: 커서, 세션 고정, 격리 쿨다운, 리셋 시각을 저장하지 않습니다. 다음 요청은 다시 1번 계정에서 시작합니다.
 
 ## 환경 변수
 
@@ -86,21 +83,14 @@ Command Code API 키는 만료되지 않습니다. 내부적으로는 10년짜�
       "userName": "mirage",
       "keyName": "cli-key",
       "enabled": true,
-      "retryAt": 1758000000000,
-      "createdAt": "2026-09-10T10:00:00.000Z",
-      "credits": {
-        "monthly": 12.5,
-        "purchased": 3.0,
-        "free": 0.5,
-        "periodEnd": 1758000000000
-      }
+      "createdAt": "2026-09-10T10:00:00.000Z"
     }
   ]
 }
 ```
 
-- `retryAt`: 쿨다운 해제 시각(ms epoch). 격리된 계정에만 존재합니다.
-- `credits`: 빌링 API에서 가져온 스냅샷(USD). `periodEnd`는 ms epoch이며, 이 시각에 `monthly`와 `free`가 리셋됩니다. `purchased`는 만료되지 않습니다.
+- 계정 파일 쓰기는 로그인/로그아웃 및 명시적인 계정 활성화 관리에서만 발생합니다. 요청 처리와 빌링 폴링은 파일을 쓰지 않습니다.
+- 이전 버전 파일의 `credits`는 시작 정렬 힌트로 읽고, 폐기된 쿨다운 필드는 호환성을 위해 무시합니다.
 - 파일이 깨져 있으면 부분 복구 없이 에러를 던집니다. 중복 `id`나 중복 `token`도 거부됩니다.
 
 ## 문제 해결
@@ -112,7 +102,7 @@ Command Code API 키는 만료되지 않습니다. 내부적으로는 10년짜�
 | `Command Code browser login timed out after 120000ms` | 브라우저 로그인이 시간 초과됐습니다. 이어지는 프롬프트에 API 키를 직접 붙여넣거나, `COMMANDCODE_AUTH_TIMEOUT_MS`를 늘리세요. |
 | `Command Code rejected the API key (whoami returned 401)` | 키가 무효합니다. Command Code 스튜디오에서 키를 다시 발급받아 로그인하세요. |
 | `Command Code whoami request failed with status 5xx` | Command Code 서버 측 오류입니다. 재시도 가능한 오류이니 잠시 후 다시 로그인하세요. |
-| `No healthy Command Code accounts available; next retry at 2026-09-16T...` | 모든 계정이 레이트리밋 쿨다운 중입니다. 메시지의 시각(가장 빠른 리셋 시각) 이후에 다시 시도하거나 `/login commandcode`로 계정을 추가하세요. |
+| `No Command Code accounts` | 활성 Command Code 계정이 없습니다. `/login commandcode`로 계정을 추가하세요. |
 | `Account credential already exists` | 같은 API 키로 이미 추가된 계정입니다. 다른 계정으로 로그인하세요. |
 | `Accounts file at ... is not valid JSON` | 계정 파일이 손상됐습니다. 백업 후 파일을 지우고 다시 로그인하세요. |
 
@@ -132,7 +122,7 @@ Command Code 공식 CLI(1.53.0)의 로그인 플로우를 재현합니다. 최�
 2. **브라우저 로그인**: `https://commandcode.ai/studio/auth/cli?callback=<콜백 URL>&state=<랜덤 토큰>&mode=redirect`를 엽니다. `state`는 32바이트 랜덤(base64url)으로, 콜백 시 일치하지 않으면 403으로 거부합니다(CSRF 방어).
 3. **키 수신**: 로그인 완료 후 스튜디오가 `GET /callback?apiKey=...&state=...&userId=...&userName=...&keyName=...`으로 리다이렉트하고, 서버는 "Authentication complete" 페이지를 보여준 뒤 약 500ms 후 닫힙니다.
 4. **검증**: 받은 키로 `GET /alpha/whoami`를 호출해 유효성을 확인합니다. 401이면 무효 키, 네트워크/5xx는 재시도 가능한 오류로 구분합니다.
-5. **저장과 회전**: 키는 계정 풀 파일에 추가되고, 요청마다 티어 규칙으로 계정을 골라 Anthropic Messages 형식 그대로 `/provider/v1/messages`에 전송합니다. 429가 오면 리셋 시각까지 격리하고 다음 계정으로 넘어갑니다.
+5. **저장과 회전**: 로그인/로그아웃만 계정 파일을 바꿉니다. 요청마다 정렬된 1번부터 스테이트리스 링을 돌며, 회전 가능한 오류면 다음 계정으로 갑니다. 마지막 계정 뒤에는 1번을 한 번만 더 시도하고, 실패 시 그 원문 오류를 그대로 전달합니다. 401/403 인증 오류와 첫 출력 뒤 오류는 즉시 전파합니다.
 
 자세한 근거는 [`docs/research/commandcode-reverse-engineering.md`](docs/research/commandcode-reverse-engineering.md)를 참고하세요.
 
