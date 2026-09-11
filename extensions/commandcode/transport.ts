@@ -19,7 +19,6 @@ const ZERO_USAGE: Usage = {
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
-
 export type StreamSimpleResult = AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 export type StreamSimpleLike = (
@@ -27,13 +26,11 @@ export type StreamSimpleLike = (
   context: Context,
   options?: SimpleStreamOptions,
 ) => StreamSimpleResult;
-
 export type FailoverStreamSimple = (
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
-
 export interface FailoverStreamOptions {
   readonly anthropicStreamSimple: StreamSimpleLike;
   readonly pool: AccountPool;
@@ -41,6 +38,10 @@ export interface FailoverStreamOptions {
   readonly now?: () => number;
   readonly refreshBilling?: (apiKey: string) => void;
 }
+
+type UpstreamResponseFailure = Readonly<{
+  status: number; body: string; headers: Readonly<Record<string, string>>;
+}>;
 
 type Failure = {
   readonly classification: ClassifyFailureInput;
@@ -56,12 +57,10 @@ type AttemptOutcome =
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
 function statusFromMessage(message: string): number | undefined {
   const match = /^(\d{3})(?:\s|$)/.exec(message);
   return match === null ? undefined : Number(match[1]);
 }
-
 function embeddedBody(message: string): unknown {
   const start = message.indexOf("{");
   const end = message.lastIndexOf("}");
@@ -72,41 +71,73 @@ function embeddedBody(message: string): unknown {
     return undefined;
   }
 }
-
 function thrownFailure(error: unknown): Failure {
   const message = error instanceof Error ? error.message : String(error);
   const statusValue = isRecord(error) ? error["status"] : undefined;
   const status = typeof statusValue === "number" ? statusValue : statusFromMessage(message);
   const body = isRecord(error) ? error["body"] : undefined;
+  const name = error instanceof Error ? error.name : undefined;
+  const code = isRecord(error) ? error["code"] : undefined;
+  const network = status === undefined && (name === "APIConnectionError" ||
+    name === "APIConnectionTimeoutError" || (typeof code === "string" &&
+    /^(?:ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)/.test(code)) || (error instanceof TypeError &&
+    /fetch|network|socket|connect/i.test(message)));
   return {
     original: error,
     classification: {
       status,
       body: body ?? embeddedBody(message),
       message,
-      network: status === undefined,
+      network,
     },
   };
 }
 
-function eventFailure(event: Extract<AssistantMessageEvent, { readonly type: "error" }>): Failure {
+function eventFailure(
+  event: Extract<AssistantMessageEvent, { readonly type: "error" }>,
+  upstream?: UpstreamResponseFailure,
+): Failure {
   const message = event.error.errorMessage ?? "Command Code request failed";
+  const diagnostic = [...(event.error.diagnostics ?? [])].reverse().find(
+    (entry) => entry.type === "provider_retry_failure",
+  );
+  const statusCode = diagnostic?.details?.["statusCode"];
+  const status = upstream?.status ??
+    (typeof statusCode === "number" ? statusCode : statusFromMessage(message));
+  const kind = diagnostic?.details?.["kind"];
+  if (upstream !== undefined) {
+    const enriched = event.error as AssistantMessage & {
+      upstreamStatus: number; upstreamBody: string; upstreamHeaders: Readonly<Record<string, string>>;
+    };
+    enriched.upstreamStatus = upstream.status;
+    enriched.upstreamBody = upstream.body;
+    enriched.upstreamHeaders = upstream.headers;
+    enriched.errorMessage = upstream.body;
+  }
   return {
     original: event,
     event,
     classification: {
-      status: statusFromMessage(message),
-      body: embeddedBody(message),
+      status,
+      body: upstream?.body ?? embeddedBody(message),
       message,
-      network: false,
+      network: kind === "connection" || kind === "timeout" || kind === "network",
     },
   };
 }
-
+function recordingFetch(baseFetch: typeof fetch, record: (failure: UpstreamResponseFailure) => void): typeof fetch {
+  return async (input, init) => {
+    const response = await baseFetch(input, init);
+    if (!response.ok) {
+      const body = await response.clone().text();
+      record({ status: response.status, body, headers: Object.fromEntries(response.headers) });
+    }
+    return response;
+  };
+}
 function isAnthropicMessagesModel(model: Model<Api>): model is Model<"anthropic-messages"> {
   return model.api === "anthropic-messages";
 }
-
 function unsupportedModelEvent(model: Model<Api>, now: number): AssistantMessageEvent {
   const failed: AssistantMessage = {
     role: "assistant",
@@ -126,7 +157,6 @@ function surface(outer: AssistantMessageEventStream, failure: Failure): void {
   if (failure.event !== undefined) outer.push(failure.event);
   else outer.fail(failure.original);
 }
-
 export function createFailoverStream(options: FailoverStreamOptions): FailoverStreamSimple {
   const attempt = async (
     token: string,
@@ -136,11 +166,17 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
     outer: AssistantMessageEventStream,
   ): Promise<AttemptOutcome> => {
     let inner: AssistantMessageEventStream;
+    let upstreamFailure: UpstreamResponseFailure | undefined;
+    const fetchImpl = recordingFetch(callOptions?.fetch ?? fetch, (failure) => {
+      upstreamFailure = failure;
+    });
     try {
       inner = await options.anthropicStreamSimple(model, context, {
         ...callOptions,
         apiKey: token,
         headers: { ...callOptions?.headers, Authorization: `Bearer ${token}` },
+        maxRetries: 0,
+        fetch: fetchImpl,
       });
     } catch (error: unknown) {
       return { kind: "failed-before-output", failure: thrownFailure(error) };
@@ -152,7 +188,7 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
         if (event.type === "error") {
           return {
             kind: forwarded ? "failed-after-output" : "failed-before-output",
-            failure: eventFailure(event),
+            failure: eventFailure(event, upstreamFailure),
           };
         }
         forwarded = true;

@@ -16,6 +16,7 @@ import {
 } from "../extensions/commandcode/accounts/pool.js";
 import { AccountStore } from "../extensions/commandcode/accounts/store.js";
 import { createFailoverStream, type StreamSimpleLike } from "../extensions/commandcode/transport.js";
+import { bootRealAdapter } from "./real-adapter.js";
 
 const NOW = 1_700_000_000_000;
 const MODEL: Model<"anthropic-messages"> = {
@@ -222,5 +223,106 @@ describe("stateless request ring", () => {
 
     expect(observed?.apiKey).toBe("token-a1");
     expect(observed?.headers?.["Authorization"]).toBe("Bearer token-a1");
+  });
+
+  it("does not rotate an abort or an unknown thrown error", async () => {
+    for (const failure of [new Error("unknown"), new DOMException("aborted", "AbortError")]) {
+      const { pool } = await setup(["a1", "a2"]);
+      const attempts: string[] = [];
+      const streamSimple = failover(pool, (_model, _context, options) => {
+        attempts.push(options?.apiKey ?? "");
+        return Promise.reject(failure);
+      });
+      expect(await failureOf(streamSimple(MODEL, CONTEXT, {}))).toBe(failure);
+      expect(attempts).toEqual(["token-a1"]);
+    }
+  });
+});
+
+describe("installed anthropic adapter boundary", () => {
+  it("rotates pre-output connection error events through [a1,a2,a1]", async () => {
+    const harness = await bootRealAdapter((request) => request.destroy());
+    try {
+      const events = await harness.request();
+      expect(harness.attempts).toEqual(["a1", "a2", "a1"]);
+      expect(events.at(-1)?.type).toBe("error");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("ignores public maxRetries so the wire budget remains [a1,a2,a1]", async () => {
+    const harness = await bootRealAdapter((request) =>
+      request.respond(429, '{"error":{"type":"rate_limit_error","message":"limited"}}', {
+        "retry-after": "0",
+      }),
+    );
+    try {
+      await harness.request({ maxRetries: 1 });
+      expect(harness.attempts).toEqual(["a1", "a2", "a1"]);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("surfaces the byte-exact final 429 body without an adapter retry marker", async () => {
+    const bodies = new Map<string, string>();
+    const harness = await bootRealAdapter((request) => {
+      const body = `{\n  "error": { "type": "rate_limit_error", "message": "raw-${harness.attempts.length}" }\n}\n`;
+      bodies.set(`${request.account}-${harness.attempts.length}`, body);
+      request.respond(429, body, { "retry-after": "0" });
+    });
+    try {
+      const terminal = (await harness.request()).at(-1);
+      expect(harness.attempts).toEqual(["a1", "a2", "a1"]);
+      expect(terminal).toMatchObject({
+        type: "error",
+        error: {
+          upstreamStatus: 429,
+          upstreamBody: bodies.get("a1-3"),
+          errorMessage: bodies.get("a1-3"),
+        },
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("surfaces a byte-exact first-attempt 403 body and stops immediately", async () => {
+    const body = '{\n  "error": { "type": "permission_error", "message": "raw-auth" }\n}\n';
+    const harness = await bootRealAdapter((request) => request.respond(403, body));
+    try {
+      const terminal = (await harness.request()).at(-1);
+      expect(harness.attempts).toEqual(["a1"]);
+      expect(terminal).toMatchObject({
+        type: "error",
+        error: { upstreamStatus: 403, upstreamBody: body, errorMessage: body },
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("surfaces a byte-exact 401 after a 429 walk and stops at a2", async () => {
+    const unauthorized = '{\n "error": {"type":"authentication_error", "message":"raw-401"}\n}\n';
+    const harness = await bootRealAdapter((request) => {
+      if (request.account === "a1") {
+        request.respond(429, '{"error":{"type":"rate_limit_error","message":"walk"}}', {
+          "retry-after": "0",
+        });
+      } else {
+        request.respond(401, unauthorized);
+      }
+    });
+    try {
+      const terminal = (await harness.request()).at(-1);
+      expect(harness.attempts).toEqual(["a1", "a2"]);
+      expect(terminal).toMatchObject({
+        type: "error",
+        error: { upstreamStatus: 401, upstreamBody: unauthorized, errorMessage: unauthorized },
+      });
+    } finally {
+      await harness.close();
+    }
   });
 });
