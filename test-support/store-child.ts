@@ -20,14 +20,19 @@ const store = new AccountStore({
 
 process.on("message", (message: unknown) => {
   if (message === "release") releaseRename?.();
-  if (message === "start") {
+  if (message === "start" || (typeof message === "object" && message !== null && "start" in message)) {
+    const offset = typeof message === "object" && message !== null && "nowOffset" in message
+      && typeof message.nowOffset === "number" ? message.nowOffset : 0;
+    const realNow = Date.now;
+    Date.now = () => realNow() + offset;
     void store.add({ id, token: `token-${id}` }).then(
       () => process.send?.({ type: "done", id }, () => process.disconnect()),
       (error: unknown) => process.send?.({
         type: "failed",
         id,
+        name: error instanceof Error ? error.name : undefined,
         message: error instanceof Error ? error.message : String(error),
-      }),
+      }, () => process.disconnect()),
     );
   }
 });

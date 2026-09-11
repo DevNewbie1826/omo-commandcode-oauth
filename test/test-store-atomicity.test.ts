@@ -21,7 +21,12 @@ async function setup(): Promise<{ readonly path: string; readonly store: Account
   return { path, store: new AccountStore({ path, now: () => NOW }) };
 }
 
-type ChildMessage = { readonly type: "ready" | "rename" | "done" | "failed"; readonly id: string; readonly message?: string };
+type ChildMessage = {
+  readonly type: "ready" | "rename" | "done" | "failed";
+  readonly id: string;
+  readonly name?: string;
+  readonly message?: string;
+};
 
 function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<ChildMessage> {
   return new Promise((resolve, reject) => {
@@ -30,6 +35,20 @@ function nextMessage(child: ChildProcess, type: ChildMessage["type"]): Promise<C
       cleanup();
       if (message.type === "failed") reject(new Error(message.message));
       else resolve(message);
+    };
+    const onExit = (code: number | null): void => { cleanup(); reject(new Error(`Store child exited ${code}`)); };
+    const cleanup = (): void => { child.off("message", onMessage); child.off("exit", onExit); };
+    child.on("message", onMessage);
+    child.on("exit", onExit);
+  });
+}
+
+function nextOutcome(child: ChildProcess): Promise<ChildMessage> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (message: ChildMessage): void => {
+      if (message.type !== "rename" && message.type !== "failed") return;
+      cleanup();
+      resolve(message);
     };
     const onExit = (code: number | null): void => { cleanup(); reject(new Error(`Store child exited ${code}`)); };
     const cleanup = (): void => { child.off("message", onMessage); child.off("exit", onExit); };
@@ -100,6 +119,39 @@ describe("AccountStore management writes", () => {
 
     expect((await new AccountStore({ path }).load()).map((account) => account.id).sort())
       .toEqual(["a", "b", "seed"]);
+  });
+
+  it("never loses an acknowledged add when a live lock owner is aged", async () => {
+    const { path, store } = await setup();
+    await store.add({ id: "seed", token: "token-seed" });
+    const [a, b] = await Promise.all([spawnStoreChild(path, "a"), spawnStoreChild(path, "b")]);
+    const aRename = nextMessage(a, "rename");
+    a.send("start");
+    await aRename;
+    expect(a.pid).toBeTypeOf("number");
+    expect(() => process.kill(a.pid!, 0)).not.toThrow();
+
+    const bOutcome = nextOutcome(b);
+    b.send({ start: true, nowOffset: 31_000 });
+    const outcome = await bOutcome;
+    const acknowledged = ["seed"];
+    if (outcome.type === "rename") {
+      const bDone = nextMessage(b, "done");
+      b.send("release");
+      await bDone;
+      acknowledged.push("b");
+      expect((await new AccountStore({ path }).load()).map((account) => account.id))
+        .toEqual(["seed", "b"]);
+    } else {
+      expect(outcome).toMatchObject({ name: "AccountStoreError" });
+    }
+
+    const aDone = nextMessage(a, "done");
+    a.send("release");
+    await aDone;
+    acknowledged.push("a");
+    const finalIds = (await new AccountStore({ path }).load()).map((account) => account.id);
+    for (const id of acknowledged) expect(finalIds).toContain(id);
   });
 
   it("recovers an exclusive lock left by a killed owner", async () => {
