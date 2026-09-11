@@ -108,8 +108,6 @@ function parseAccount(value: unknown, index: number): AccountRecord {
   if (enabled !== undefined && typeof enabled !== "boolean") {
     throw new AccountStoreError(`Expected ${context} field "enabled" to be a boolean`);
   }
-  // Legacy tolerance: retryAt is deliberately ignored. Cooldowns are no longer state.
-  void value["retryAt"];
   const credits = value["credits"];
   return {
     id: requiredString(value, "id", context),

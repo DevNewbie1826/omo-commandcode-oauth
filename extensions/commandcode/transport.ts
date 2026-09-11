@@ -137,12 +137,11 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
   ): Promise<AttemptOutcome> => {
     let inner: AssistantMessageEventStream;
     try {
-      const result = options.anthropicStreamSimple(model, context, {
+      inner = await options.anthropicStreamSimple(model, context, {
         ...callOptions,
         apiKey: token,
         headers: { ...callOptions?.headers, Authorization: `Bearer ${token}` },
       });
-      inner = result instanceof Promise ? await result : result;
     } catch (error: unknown) {
       return { kind: "failed-before-output", failure: thrownFailure(error) };
     }

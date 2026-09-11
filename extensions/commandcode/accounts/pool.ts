@@ -1,5 +1,4 @@
-import type { AccountCredits, AccountRecord } from "./schema.js";
-import { AccountStoreError } from "./schema.js";
+import { AccountStoreError, type AccountCredits, type AccountRecord } from "./schema.js";
 import type { AccountStore } from "./store.js";
 
 export const DEFAULT_EXPIRY_WINDOW_MS = 86_400_000;

@@ -155,16 +155,16 @@ export function modelsFromCache(value: unknown): readonly CommandCodeModel[] {
 }
 
 function resolveCachePath(cachePath?: string): string {
-  if (cachePath !== undefined && cachePath.length > 0) return cachePath;
+  if (cachePath) return cachePath;
   const fromEnv = process.env.COMMANDCODE_MODELS_CACHE;
-  if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv;
+  if (fromEnv) return fromEnv;
   return join(homedir(), ".commandcode", "omo-models.json");
 }
 
 function resolveUrl(url?: string): string {
-  if (url !== undefined && url.length > 0) return url;
+  if (url) return url;
   const override = process.env.COMMANDCODE_API_BASE;
-  if (override !== undefined && override.length > 0) {
+  if (override) {
     return `${override.replace(/\/+$/, "")}/provider/v1/models`;
   }
   return DEFAULT_MODELS_URL;
@@ -182,7 +182,7 @@ async function writeCache(cachePath: string, models: readonly CommandCodeModel[]
 
 async function fetchLiveModels(options: LoadModelsOptions): Promise<readonly CommandCodeModel[]> {
   const headers: Record<string, string> = { accept: "application/json" };
-  if (options.apiKey !== undefined && options.apiKey.length > 0) {
+  if (options.apiKey) {
     headers.authorization = `Bearer ${options.apiKey}`;
   }
   const fetchImpl = options.fetchImpl ?? fetch;

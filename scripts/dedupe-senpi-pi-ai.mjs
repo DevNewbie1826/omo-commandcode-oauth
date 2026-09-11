@@ -18,9 +18,7 @@ const topLevelPackage = join(
 );
 
 try {
-  if (!existsSync(nestedScope) || !existsSync(topLevelPackage)) {
-    process.exitCode = 0;
-  } else {
+  if (existsSync(nestedScope) && existsSync(topLevelPackage)) {
     const packageJson = JSON.parse(readFileSync(topLevelPackage, "utf8"));
     const nestedPackage = join(nestedScope, "pi-ai", "package.json");
     if (packageJson?.name === "@code-yeongyu/senpi-ai" && existsSync(nestedPackage)) {
@@ -29,9 +27,7 @@ try {
         rmSync(nestedScope, { recursive: true, force: true });
       }
     }
-    process.exitCode = 0;
   }
-} catch (error) {
-  void error;
-  process.exitCode = 0;
+} catch {
+  // Deduplication is best-effort and must not block installation.
 }

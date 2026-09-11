@@ -207,8 +207,6 @@ async function loginInBrowser(
   const apiKey = await obtainApiKey(callbacks, waitForCallback, server, options.authTimeoutMs);
   await options.validate(apiKey);
   const credentials = credentialsFromApiKey(apiKey, options.now);
-  // Awaited so persistence failures (e.g. an unwritable accounts file) fail the
-  // login instead of silently dropping the credential.
   await options.onCredential?.(apiKey);
   return credentials;
 }

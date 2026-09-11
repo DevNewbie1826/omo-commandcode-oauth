@@ -29,7 +29,6 @@ function containsRateLimit(value: unknown, depth = 0): boolean {
   return Object.values(value).some((entry) => containsRateLimit(entry, depth + 1));
 }
 
-/** Classify failures only; no cooldown or reset-time state is computed. */
 export function classifyFailure(input: ClassifyFailureInput): FailureClass {
   if (input.status === 401 || input.status === 403) return "propagate";
   if (input.status === 429 || (input.status !== undefined && input.status >= 500)) {

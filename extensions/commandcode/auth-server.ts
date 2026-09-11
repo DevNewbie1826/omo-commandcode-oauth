@@ -128,25 +128,12 @@ export async function startAuthServer(options: StartAuthServerOptions): Promise<
   }
   const port = address.port;
 
-  const callbackHandlers: {
-    resolve: ((payload: AuthCallbackPayload) => void) | undefined;
-    reject: ((error: Error) => void) | undefined;
-  } = { resolve: undefined, reject: undefined };
+  let resolveCallback!: (payload: AuthCallbackPayload) => void;
+  let rejectCallback!: (error: Error) => void;
   const waitForCallback = new Promise<AuthCallbackPayload>((resolve, reject) => {
-    callbackHandlers.resolve = resolve;
-    callbackHandlers.reject = reject;
+    resolveCallback = resolve;
+    rejectCallback = reject;
   });
-
-  const resolveCallback = (payload: AuthCallbackPayload): void => {
-    const resolve = callbackHandlers.resolve;
-    if (resolve === undefined) throw new CommandCodeAuthError("Callback promise resolver was not initialized");
-    resolve(payload);
-  };
-  const rejectCallback = (error: Error): void => {
-    const reject = callbackHandlers.reject;
-    if (reject === undefined) throw new CommandCodeAuthError("Callback promise rejecter was not initialized");
-    reject(error);
-  };
 
   let settled = false;
   const settleReject = (error: Error): void => {

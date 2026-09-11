@@ -1,11 +1,3 @@
-/**
- * Command Code (commandcode.ai) provider extension.
- *
- * Registers the "commandcode" provider on the anthropic-messages API with
- * browser OAuth login, a shared multi-account store, and a rate-limit
- * rotating failover transport. Login and logout management are the only
- * writers of the shared account file; request routing is stateless.
- */
 import { randomUUID } from "node:crypto";
 import type { ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
@@ -48,7 +40,6 @@ try {
   );
 }
 
-/** Structural surface of the extension host this entry needs (satisfied by the real ExtensionAPI). */
 export interface CommandCodeHost {
   readonly registerProvider: (name: string, config: ProviderConfig) => void;
 }
@@ -61,13 +52,9 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function normalizeBase(value: string): string {
-  return value.replace(/\/+$/, "");
-}
-
 function resolveApiBase(): string {
   const raw = process.env["COMMANDCODE_API_BASE"];
-  return normalizeBase(raw === undefined || raw.length === 0 ? DEFAULT_API_BASE : raw);
+  return (raw === undefined || raw.length === 0 ? DEFAULT_API_BASE : raw).replace(/\/+$/, "");
 }
 
 function stringField(record: Record<string, unknown>, key: string): string {
@@ -86,7 +73,6 @@ function parseWhoami(payload: unknown): WhoamiInfo {
   return { userId: stringField(user, "id"), userName: stringField(user, "userName") };
 }
 
-/** The whoami identity check used to both validate a fresh key and capture pool metadata. */
 async function fetchWhoami(apiKey: string, apiBase: string): Promise<WhoamiInfo> {
   let response: Response;
   try {

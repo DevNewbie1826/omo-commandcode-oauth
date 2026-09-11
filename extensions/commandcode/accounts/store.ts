@@ -38,10 +38,6 @@ function errorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-function sameContents(left: string | undefined, right: string | undefined): boolean {
-  return left === right;
-}
-
 export class AccountStore {
   private readonly clock: () => number;
   private records: readonly AccountRecord[] = [];
@@ -71,8 +67,7 @@ export class AccountStore {
 
   async add(input: AccountRecordInput): Promise<void> {
     const createdAt = input.createdAt ?? new Date(this.clock()).toISOString();
-    const [record] = parseAccountRecords([{ ...input, enabled: input.enabled ?? true, createdAt }]);
-    if (record === undefined) throw new AccountStoreError("Expected an account record");
+    const record = parseAccountRecords([{ ...input, enabled: input.enabled ?? true, createdAt }])[0]!;
     await this.update((records) => {
       if (records.some((candidate) => candidate.id === record.id)) {
         throw new AccountStoreError(`Account id already exists: ${record.id}`);
@@ -106,7 +101,7 @@ export class AccountStore {
     transform: (records: readonly AccountRecord[]) => readonly AccountRecord[],
   ): Promise<void> {
     const previous = pathQueues.get(this.options.path) ?? Promise.resolve();
-    let release: (() => void) | undefined;
+    let release!: () => void;
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -116,7 +111,7 @@ export class AccountStore {
     try {
       await this.compareAndSwap(transform);
     } finally {
-      release?.();
+      release();
       if (pathQueues.get(this.options.path) === queued) pathQueues.delete(this.options.path);
     }
   }
@@ -141,7 +136,7 @@ export class AccountStore {
       const temporary = `${this.options.path}.tmp-${process.pid}-${randomUUID()}`;
       await this.writeTemporary(temporary, serializeAccountFile(next));
       try {
-        if (!sameContents(before, await this.readRaw())) continue;
+        if (before !== await this.readRaw()) continue;
         await rename(temporary, this.options.path);
         this.records = next;
         return;

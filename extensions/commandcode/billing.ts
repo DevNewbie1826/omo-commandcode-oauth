@@ -155,14 +155,12 @@ export async function fetchBillingSnapshot(
     });
     const subscriptionsPayload = await readJson(subscriptionsResponse, "subscriptions");
     const credits = parseCredits(creditsPayload);
-    const snapshot: BillingSnapshot = {
+    return {
       monthly: credits.monthly,
       purchased: credits.purchased,
       free: credits.free,
       periodEnd: parseSubscriptions(subscriptionsPayload),
     };
-    if (!isValidSnapshot(snapshot)) return undefined;
-    return snapshot;
   } catch (_error: unknown) {
     return undefined;
   }
