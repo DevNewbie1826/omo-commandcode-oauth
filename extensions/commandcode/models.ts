@@ -2,13 +2,16 @@ export const DEFAULT_MODELS_URL = "https://api.commandcode.ai/provider/v1/models
 const MAX_TOKENS = 65_536;
 const MAX_CONTEXT = 10_000_000;
 /**
- * Command Code accepts a thinking request for every model family it serves: live probes against
- * `/provider/v1/chat/completions` with `reasoning_effort: "high"` returned success for deepseek,
- * moonshot, z-ai, qwen, minimax, xiaomi, stepfun, xai, meta, tencent and thinkingmachines ids
- * (only out-of-plan models failed, with a plan error rather than a parameter rejection), and the
- * anthropic route carries thinking natively. Advertising a model as non-reasoning makes the host
- * withhold the thinking level entirely, so the catalog marks every model reasoning-capable and
- * lets the upstream error surface verbatim if a specific model ever refuses the parameter.
+ * Every served model is advertised as thinking-capable because that is what the upstream actually
+ * does. Live probes against `/provider/v1/chat/completions` (reasoning_effort "high", 80 output
+ * tokens, "think step by step" prompt) reported non-zero `usage.completion_tokens_details
+ * .reasoning_tokens` for eleven of twelve families: deepseek-v4.1-flash 47, Kimi-K2.6 80, GLM-5.2
+ * 80, Qwen3.8-Flash 74, MiniMax-M2.5 71, mimo-v2.5 80, Step-3.5-Flash 83, grok-4.5 153,
+ * muse-spark-1.2 77, hy3-paid 80, inkling-small 78; only Kimi-K3 returned zero, and it accepted the
+ * parameter without error. The anthropic route carries thinking natively. Since a model advertised
+ * as non-reasoning makes the host withhold the thinking level entirely (which is what previously
+ * made reasoning settings look inert), the catalog advertises thinking everywhere and lets any
+ * upstream refusal surface verbatim instead of being pre-empted by a guess about capability.
  */
 
 export type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
