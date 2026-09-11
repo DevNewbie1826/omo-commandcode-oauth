@@ -1,0 +1,36 @@
+{
+  "name": "omo-commandcode-oauth",
+  "version": "0.1.0",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "postinstall": "node scripts/dedupe-senpi-pi-ai.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@code-yeongyu/senpi": "2026.9.9-2",
+    "@earendil-works/pi-ai": "npm:@code-yeongyu/senpi-ai@2026.9.9-2",
+    "@types/node": "^22",
+    "typescript": "^5",
+    "vitest": "^3"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "senpi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
