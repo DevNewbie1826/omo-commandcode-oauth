@@ -5,9 +5,12 @@ const REASONING_MARKERS = ["gpt", "o3", "claude", "glm", "deepseek-reasoner", "q
 
 export type FetchImpl = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+export type CommandCodeApi = "anthropic-messages" | "openai-completions";
+
 export interface CommandCodeModel {
   readonly id: string;
   readonly name: string;
+  readonly api: CommandCodeApi;
   readonly reasoning: boolean;
   readonly contextWindow: number;
   readonly maxTokens: number;
@@ -44,10 +47,15 @@ export function isReasoningModel(id: string): boolean {
   return REASONING_MARKERS.some((marker) => haystack.includes(marker));
 }
 
+export function apiForModel(id: string): CommandCodeApi {
+  return id.toLowerCase().startsWith("claude") ? "anthropic-messages" : "openai-completions";
+}
+
 function catalogModel(id: string, name: string, contextWindow: number): CommandCodeModel {
   return {
     id,
     name,
+    api: apiForModel(id),
     reasoning: isReasoningModel(id),
     contextWindow,
     maxTokens: Math.min(contextWindow, MAX_TOKENS),

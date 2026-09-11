@@ -25,14 +25,17 @@ const PROVIDER_ID = "commandcode";
 const PROVIDER_NAME = "Command Code (unofficial)";
 
 /** Transport modules are optional at runtime: without them the provider registers without failover. */
-let anthropicStreamSimple: StreamSimpleLike | undefined;
+let anthropicStreamSimple: StreamSimpleLike<"anthropic-messages"> | undefined;
+let openaiStreamSimple: StreamSimpleLike<"openai-completions"> | undefined;
 let createEventStream: (() => AssistantMessageEventStream) | undefined;
 try {
-  const [apiMessages, eventStreams] = await Promise.all([
+  const [apiMessages, apiCompletions, eventStreams] = await Promise.all([
     import("@earendil-works/pi-ai/api/anthropic-messages"),
+    import("@earendil-works/pi-ai/api/openai-completions"),
     import("@earendil-works/pi-ai/utils/event-stream"),
   ]);
   anthropicStreamSimple = apiMessages.streamSimple;
+  openaiStreamSimple = apiCompletions.streamSimple;
   createEventStream = eventStreams.createAssistantMessageEventStream;
 } catch (error) {
   console.debug(
@@ -108,24 +111,24 @@ async function addPoolAccount(store: AccountStore, apiKey: string, whoami: Whoam
   });
 }
 
-function toProviderModels(models: readonly CommandCodeModel[], baseUrl: string): ProviderModelConfig[] {
+function toProviderModels(models: readonly CommandCodeModel[], apiBase: string): ProviderModelConfig[] {
   return models.map((model) => ({
     id: model.id,
     name: model.name,
+    api: model.api,
     reasoning: model.reasoning,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
-    baseUrl,
+    baseUrl: model.api === "anthropic-messages" ? `${apiBase}/provider` : `${apiBase}/provider/v1`,
   }));
 }
 
 export default async function commandcodeExtension(pi: CommandCodeHost): Promise<void> {
   const apiBase = resolveApiBase();
-  // The pi-ai anthropic-messages adapter appends `/v1/messages` to the model
-  // baseUrl, so models must carry `{apiBase}/provider` for requests to land on
-  // the Command Code provider plane (`{apiBase}/provider/v1/messages`).
+  // Each adapter appends its own endpoint: Anthropic needs `/provider`, while
+  // the OpenAI SDK needs `/provider/v1` before appending `/chat/completions`.
   const upstreamBaseUrl = `${apiBase}/provider`;
   const store = new AccountStore({ path: resolveAccountsFilePath() });
   const pool = new AccountPool({ store });
@@ -141,13 +144,13 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
   );
 
   const failover =
-    anthropicStreamSimple === undefined || createEventStream === undefined
+    anthropicStreamSimple === undefined || openaiStreamSimple === undefined || createEventStream === undefined
       ? undefined
       : createFailoverStream({
           anthropicStreamSimple,
+          openaiStreamSimple,
           pool,
           createEventStream,
-          now: Date.now,
           refreshBilling: (apiKey: string): void => {
             void refreshBillingSnapshot(apiKey);
           },
@@ -190,7 +193,7 @@ export default async function commandcodeExtension(pi: CommandCodeHost): Promise
     api: "anthropic-messages",
     authHeader: true,
     baseUrl: upstreamBaseUrl,
-    models: toProviderModels(catalog.models, upstreamBaseUrl),
+    models: toProviderModels(catalog.models, apiBase),
     ...(failover === undefined ? {} : { streamSimple: failover }),
     oauth: {
       name: PROVIDER_NAME,

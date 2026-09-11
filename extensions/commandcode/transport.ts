@@ -5,45 +5,54 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
-  Usage,
 } from "@earendil-works/pi-ai";
 import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import type { AccountPool } from "./accounts/pool.js";
 import { classifyFailure, type ClassifyFailureInput } from "./ratelimit.js";
+import type { CommandCodeApi } from "./models.js";
 
-const ZERO_USAGE: Usage = {
-  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
 export type StreamSimpleResult = AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
-
-export type StreamSimpleLike = (model: Model<"anthropic-messages">, context: Context,
-  options?: SimpleStreamOptions) => StreamSimpleResult;
+export type StreamSimpleLike<TApi extends CommandCodeApi = "anthropic-messages"> = (
+  model: Model<TApi>, context: Context, options?: SimpleStreamOptions,
+) => StreamSimpleResult;
 export type FailoverStreamSimple = (
-  model: Model<Api>,
-  context: Context,
-  options?: SimpleStreamOptions,
+  model: Model<Api>, context: Context, options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 export interface FailoverStreamOptions {
-  readonly anthropicStreamSimple: StreamSimpleLike;
+  readonly anthropicStreamSimple: StreamSimpleLike<"anthropic-messages">;
+  readonly openaiStreamSimple: StreamSimpleLike<"openai-completions">;
   readonly pool: AccountPool;
   readonly createEventStream: () => AssistantMessageEventStream;
-  readonly now?: () => number;
   readonly refreshBilling?: (apiKey: string) => void;
 }
 
-type UpstreamResponseFailure = Readonly<{ status: number; body: string; headers: Readonly<Record<string, string>> }>;
+export class UnsupportedCommandCodeApiError extends Error {
+  constructor(api: Api) {
+    super(`Command Code transport does not support api "${api}"`);
+    this.name = "UnsupportedCommandCodeApiError";
+  }
+}
 
+class AccountOrderingInvariantError extends Error {
+  constructor() {
+    super("Account ordering invariant failed");
+    this.name = "AccountOrderingInvariantError";
+  }
+}
+
+type UpstreamResponseFailure = Readonly<{
+  status: number; body: string; headers: Readonly<Record<string, string>>;
+}>;
 type Failure = {
   readonly classification: ClassifyFailureInput;
   readonly original: unknown;
   readonly event?: AssistantMessageEvent;
 };
-
 type AttemptOutcome =
   | { readonly kind: "completed" }
   | { readonly kind: "failed-before-output"; readonly failure: Failure }
   | { readonly kind: "failed-after-output"; readonly failure: Failure };
+type SelectedAdapter = (context: Context, options?: SimpleStreamOptions) => StreamSimpleResult;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -75,15 +84,9 @@ function thrownFailure(error: unknown): Failure {
     /fetch|network|socket|connect/i.test(message)));
   return {
     original: error,
-    classification: {
-      status,
-      body: body ?? embeddedBody(message),
-      message,
-      network,
-    },
+    classification: { status, body: body ?? embeddedBody(message), message, network },
   };
 }
-
 function eventFailure(
   event: Extract<AssistantMessageEvent, { readonly type: "error" }>,
   upstream?: UpstreamResponseFailure,
@@ -135,32 +138,27 @@ function recordingFetch(baseFetch: typeof fetch, record: (failure: UpstreamRespo
     return new Response(failure.body, { status: failure.status, headers: failure.headers });
   };
 }
-function isAnthropicMessagesModel(model: Model<Api>): model is Model<"anthropic-messages"> {
-  return model.api === "anthropic-messages";
+function isModel<TApi extends CommandCodeApi>(model: Model<Api>, api: TApi): model is Model<TApi> {
+  return model.api === api;
 }
-function unsupportedModelEvent(model: Model<Api>, now: number): AssistantMessageEvent {
-  const failed: AssistantMessage = {
-    role: "assistant",
-    content: [],
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    usage: ZERO_USAGE,
-    stopReason: "error",
-    errorMessage: `Command Code transport requires an anthropic-messages model (received api "${model.api}")`,
-    timestamp: now,
-  };
-  return { type: "error", reason: "error", error: failed };
+function selectAdapter(options: FailoverStreamOptions, model: Model<Api>): SelectedAdapter {
+  if (isModel(model, "anthropic-messages")) {
+    return (context, callOptions) => options.anthropicStreamSimple(model, context, callOptions);
+  }
+  if (isModel(model, "openai-completions")) {
+    return (context, callOptions) => options.openaiStreamSimple(model, context, callOptions);
+  }
+  throw new UnsupportedCommandCodeApiError(model.api);
 }
-
 function surface(outer: AssistantMessageEventStream, failure: Failure): void {
   if (failure.event !== undefined) outer.push(failure.event);
   else outer.fail(failure.original);
 }
+
 export function createFailoverStream(options: FailoverStreamOptions): FailoverStreamSimple {
   const attempt = async (
     token: string,
-    model: Model<"anthropic-messages">,
+    adapter: SelectedAdapter,
     context: Context,
     callOptions: SimpleStreamOptions | undefined,
     outer: AssistantMessageEventStream,
@@ -171,7 +169,7 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
       upstreamFailure = failure;
     });
     try {
-      inner = await options.anthropicStreamSimple(model, context, {
+      inner = await adapter(context, {
         ...callOptions,
         apiKey: token,
         headers: { ...callOptions?.headers, Authorization: `Bearer ${token}` },
@@ -181,7 +179,6 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
     } catch (error: unknown) {
       return { kind: "failed-before-output", failure: thrownFailure(error) };
     }
-
     let forwarded = false;
     try {
       for await (const event of inner) {
@@ -205,17 +202,19 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
 
   const drive = async (
     outer: AssistantMessageEventStream,
-    model: Model<"anthropic-messages">,
+    adapter: SelectedAdapter,
     context: Context,
     callOptions: SimpleStreamOptions | undefined,
   ): Promise<void> => {
     try {
       const ordered = await options.pool.ordered();
-      const attempts = [...ordered, ordered[0]];
+      const first = ordered[0];
+      if (first === undefined) throw new AccountOrderingInvariantError();
+      const attempts = [...ordered, first];
       for (let index = 0; index < attempts.length; index += 1) {
         const account = attempts[index];
-        if (account === undefined) throw new Error("Account ordering invariant failed");
-        const outcome = await attempt(account.token, model, context, callOptions, outer);
+        if (account === undefined) throw new AccountOrderingInvariantError();
+        const outcome = await attempt(account.token, adapter, context, callOptions, outer);
         if (outcome.kind === "completed") {
           outer.end();
           return;
@@ -224,10 +223,8 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
           surface(outer, outcome.failure);
           return;
         }
-        if (
-          classifyFailure(outcome.failure.classification) === "propagate" ||
-          index === attempts.length - 1
-        ) {
+        if (classifyFailure(outcome.failure.classification) === "propagate" ||
+          index === attempts.length - 1) {
           surface(outer, outcome.failure);
           return;
         }
@@ -240,11 +237,11 @@ export function createFailoverStream(options: FailoverStreamOptions): FailoverSt
 
   return (model, context, callOptions) => {
     const outer = options.createEventStream();
-    if (!isAnthropicMessagesModel(model)) {
-      outer.push(unsupportedModelEvent(model, (options.now ?? Date.now)()));
-      return outer;
+    try {
+      void drive(outer, selectAdapter(options, model), context, callOptions);
+    } catch (error: unknown) {
+      outer.fail(error);
     }
-    void drive(outer, model, context, callOptions);
     return outer;
   };
 }

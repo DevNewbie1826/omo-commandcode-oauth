@@ -31,6 +31,13 @@ const MODEL: Model<"anthropic-messages"> = {
   contextWindow: 200_000,
   maxTokens: 65_536,
 };
+const OPENAI_MODEL: Model<"openai-completions"> = {
+  ...MODEL,
+  id: "gpt-5.5",
+  name: "gpt-5.5",
+  api: "openai-completions",
+  baseUrl: "https://api.commandcode.ai/provider/v1",
+};
 const CONTEXT: Context = { messages: [] };
 const ZERO_USAGE = {
   input: 0,
@@ -100,8 +107,8 @@ function failover(pool: AccountPool, streamSimple: StreamSimpleLike) {
   return createFailoverStream({
     pool,
     anthropicStreamSimple: streamSimple,
+    openaiStreamSimple: (_model, context, options) => streamSimple(MODEL, context, options),
     createEventStream: createAssistantMessageEventStream,
-    now: () => NOW,
   });
 }
 
@@ -185,6 +192,30 @@ describe("stateless request ring", () => {
     expect(attempts).toEqual(["token-a1"]);
   });
 
+  it("routes an OpenAI post-output failure without replay", async () => {
+    const { pool } = await setup(["a1", "a2"]);
+    const attempts: string[] = [];
+    const terminal = new HttpFailure("mid-stream", 500, { partial: true });
+    const anthropicStreamSimple: StreamSimpleLike = () => {
+      throw new Error("wrong adapter");
+    };
+    const streamSimple = createFailoverStream({
+      pool,
+      anthropicStreamSimple,
+      openaiStreamSimple: (_model, _context, options) => {
+        attempts.push(options?.apiKey ?? "");
+        const stream = createAssistantMessageEventStream();
+        stream.push(startEvent());
+        stream.fail(terminal);
+        return stream;
+      },
+      createEventStream: createAssistantMessageEventStream,
+    });
+
+    expect(await failureOf(streamSimple(OPENAI_MODEL, CONTEXT, {}))).toBe(terminal);
+    expect(attempts).toEqual(["token-a1"]);
+  });
+
   it("T5 file untouched: full rotation changes neither content nor mtime", async () => {
     const { pool, path } = await setup(["a1", "a2", "a3"]);
     const beforeContent = await readFile(path);
@@ -235,6 +266,48 @@ describe("stateless request ring", () => {
       });
       expect(await failureOf(streamSimple(MODEL, CONTEXT, {}))).toBe(failure);
       expect(attempts).toEqual(["token-a1"]);
+    }
+  });
+});
+
+describe("installed OpenAI adapter boundary", () => {
+  it("rotates all-429 responses through [a1,a2,a1] at chat/completions and surfaces the final bytes", async () => {
+    const bodies = new Map<string, string>();
+    const harness = await bootRealAdapter((request) => {
+      const body = `{\n  "error": { "type": "rate_limit_error", "message": "raw-${harness.attempts.length}" }\n}\n`;
+      bodies.set(`${request.account}-${harness.attempts.length}`, body);
+      request.respond(429, body, { "retry-after": "0" });
+    }, "openai-completions");
+    try {
+      const terminal = (await harness.request()).at(-1);
+      expect(harness.attempts).toEqual(["a1", "a2", "a1"]);
+      expect(harness.paths).toEqual(Array(3).fill("/provider/v1/chat/completions"));
+      expect(terminal).toMatchObject({
+        type: "error",
+        error: {
+          upstreamStatus: 429,
+          upstreamBody: bodies.get("a1-3"),
+          errorMessage: bodies.get("a1-3"),
+        },
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("propagates a byte-exact 401 immediately without trying another account", async () => {
+    const body = '{\n  "error": { "type": "authentication_error", "message": "raw-openai-auth" }\n}\n';
+    const harness = await bootRealAdapter((request) => request.respond(401, body), "openai-completions");
+    try {
+      const terminal = (await harness.request()).at(-1);
+      expect(harness.attempts).toEqual(["a1"]);
+      expect(harness.paths).toEqual(["/provider/v1/chat/completions"]);
+      expect(terminal).toMatchObject({
+        type: "error",
+        error: { upstreamStatus: 401, upstreamBody: body, errorMessage: body },
+      });
+    } finally {
+      await harness.close();
     }
   });
 });

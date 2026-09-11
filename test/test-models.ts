@@ -17,8 +17,8 @@ const API_RESPONSE = {
   ],
 } as const;
 const EXPECTED: readonly CommandCodeModel[] = [
-  { id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", reasoning: false, contextWindow: 1_000_000, maxTokens: 65_536 },
-  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", reasoning: true, contextWindow: 200_000, maxTokens: 65_536 },
+  { id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", api: "openai-completions", reasoning: false, contextWindow: 1_000_000, maxTokens: 65_536 },
+  { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", api: "anthropic-messages", reasoning: true, contextWindow: 200_000, maxTokens: 65_536 },
 ];
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -28,7 +28,7 @@ function successfulFetch(body: unknown = API_RESPONSE): FetchImpl {
 }
 
 describe("modelsFromApiResponse", () => {
-  it("maps ids, names, reasoning, rounded context, and capped output", () => {
+  it("maps ids, names, routes, reasoning, rounded context, and capped output", () => {
     expect(modelsFromApiResponse(API_RESPONSE)).toEqual(EXPECTED);
   });
 
@@ -42,7 +42,7 @@ describe("modelsFromApiResponse", () => {
     expect(modelsFromApiResponse({
       object: "list",
       data: [{ id: "gpt-5.5", name: "GPT-5.5", context_length: 128_000.6 }],
-    })[0]).toMatchObject({ contextWindow: 128_001, maxTokens: 65_536 });
+    })[0]).toMatchObject({ api: "openai-completions", contextWindow: 128_001, maxTokens: 65_536 });
   });
 });
 
