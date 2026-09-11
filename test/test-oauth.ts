@@ -404,4 +404,32 @@ describe("createLogin key validation", () => {
     const validation = assertInstance(failure, CommandCodeKeyValidationError);
     expect(validation.retryable).toBe(true);
   });
+
+  test("Given a browser CORS preflight, When OPTIONS /callback arrives, Then it responds 204 with commandcode.ai allowed", async () => {
+    const { server, port } = await startAuthServer({ expectedState: "st" });
+    OPEN_SERVERS.push(server);
+    const res = await fetch(`http://127.0.0.1:${port}/callback?apiKey=k&state=st`, {
+      method: "OPTIONS",
+      headers: { origin: "https://commandcode.ai", "access-control-request-method": "POST" },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("https://commandcode.ai");
+    expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+    closeServer(server);
+  });
+
+  test("Given the studio posts credentials, When POST /callback carries a JSON body, Then waitForCallback resolves them", async () => {
+    const { server, port, waitForCallback } = await startAuthServer({ expectedState: "st" });
+    OPEN_SERVERS.push(server);
+    const res = await fetch(`http://127.0.0.1:${port}/callback`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://commandcode.ai" },
+      body: JSON.stringify({ apiKey: "user_posted", state: "st", userId: "u1", userName: "Poster", keyName: "cli" }),
+    });
+    expect([200, 204]).toContain(res.status);
+    const creds = await waitForCallback;
+    expect(creds).toMatchObject({ apiKey: "user_posted", state: "st", userId: "u1", userName: "Poster", keyName: "cli" });
+    closeServer(server);
+  });
+
 });
