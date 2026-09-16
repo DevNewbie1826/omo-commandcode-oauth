@@ -3,7 +3,6 @@ import type { ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import {
   streamSimple,
   createAssistantMessageEventStream,
-  type AssistantMessageEventStream,
   type OAuthCredentials,
 } from "@earendil-works/pi-ai/compat";
 import { AccountPool } from "./accounts/pool.js";
