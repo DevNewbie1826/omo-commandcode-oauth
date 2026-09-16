@@ -34,4 +34,18 @@ describe("host extension import surface", () => {
     }
     expect(violations).toEqual([]);
   });
+
+  it("Given the commandcode host source, When its pi-ai imports are inspected, Then it uses static compat value imports without dynamic pi-ai imports", async () => {
+    const path = join(process.cwd(), "extensions/commandcode/index.ts");
+    const source = await readFile(path, "utf8");
+    const violations: string[] = [];
+    const dynamicImports = source.match(/\bimport\s*\(\s*["']@earendil-works\/pi-ai(?:\/[^"']*)?["']/g) ?? [];
+    for (const dynamicImport of dynamicImports) {
+      violations.push(`dynamic pi-ai import: ${dynamicImport}`);
+    }
+    if (!/\bimport\s+(?!type\b)\{[\s\S]*?\bstreamSimple\b[\s\S]*?\bcreateAssistantMessageEventStream\b[\s\S]*?\}\s+from\s*["']@earendil-works\/pi-ai\/compat["']/.test(source)) {
+      violations.push("missing static value import from @earendil-works/pi-ai/compat");
+    }
+    expect(violations).toEqual([]);
+  });
 });
